@@ -20,31 +20,28 @@ def load_data(file):
     
     # 1. Opschonen en Numeriek maken
     for col in ['Consumer', 'Prosumer', 'Producer']:
-        # Vervang komma's, forceer naar getal, fouten worden NaN
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
     
-    # 2. Datum parsen en SORTEREN (Cruciaal voor de grafiek!)
+    # 2. Datum parsen en SORTEREN
     df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
-    df = df.sort_values('Date') # <--- Dit lost vaak de 'gekke' blokken op
+    df = df.sort_values('Date') 
     
-    # 3. Gaten in de data dichten (Resampling)
-    # We maken een perfecte tijdlijn per 15 minuten en plakken de data erop
+    # --- DE FIX VOOR WINTERTIJD ---
+    # Verwijder dubbele tijdstippen (bijv. de extra 02:00 bij wintertijd wissel)
+    df = df.drop_duplicates(subset='Date', keep='first')
+    # ------------------------------
+
+    # 3. Tijdlijn repareren (Gaten vullen)
     df = df.set_index('Date')
-    # '15min' is de oude pandas code, voor nieuwere pandas versies gebruik '15T' of '15min'
     df = df.asfreq('15min') 
-    
-    # 4. Ontbrekende waarden opvullen (Forward Fill: neem waarde van vorig kwartier)
-    # Dit zorgt dat lijnen niet onderbroken worden als er 1 kwartier mist
     df = df.ffill()
-    
-    # Reset index zodat 'Date' weer een kolom is
     df = df.reset_index()
 
-    # 5. Omrekenen naar MW
+    # 4. Omrekenen naar MW
     for col in ['Consumer', 'Prosumer', 'Producer']:
         df[f'{col}_MW'] = (df[col] * 4) / 1000
     
-    # 6. Peak & Tijd Kenmerken opnieuw bepalen (op de schone tijdlijn)
+    # 5. Peak & Tijd Kenmerken
     df['is_peak'] = (df['Date'].dt.weekday < 5) & (df['Date'].dt.hour >= 8) & (df['Date'].dt.hour < 20)
     df['Quarter'] = df['Date'].dt.quarter
     
