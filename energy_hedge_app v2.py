@@ -5,9 +5,9 @@ import altair as alt
 import os
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge Optimizer 4.1", layout="wide")
+st.set_page_config(page_title="Energy Hedge Optimizer 4.2", layout="wide")
 
-st.title("⚡ Energy Hedge Optimizer 4.1")
+st.title("⚡ Energy Hedge Optimizer 4.2")
 st.markdown("""
 Kies een automatische strategie of stel de blokken handmatig bij. 
 De optimizer berekent de ideale MW-waarden op basis van je gekozen risicoprofiel.
@@ -49,7 +49,7 @@ def load_data(file):
 try:
     df = load_data(uploaded_file)
     if df is None:
-        st.warning("Upload een bestand om te beginnen.")
+        st.warning("⚠️ Upload een bestand om te beginnen.")
         st.stop()
 except Exception as e:
     st.error(f"Error: {e}")
@@ -61,20 +61,21 @@ profile_choice = st.sidebar.selectbox("Kies Profiel", ["Consumer", "Prosumer", "
 strategy_period = st.sidebar.radio("Periode", ["Per Jaar", "Per Kwartaal"])
 p_mw_col = f'{profile_choice}_MW'
 
-# Initialiseer session state voor de sliders als ze er nog niet zijn
-if 'slider_values' not in st.session_state:
-    st.session_state['slider_values'] = {}
+# Bepaal dynamische slider ranges op basis van de data
+p_max = df[p_mw_col].max()
+p_min = df[p_mw_col].min()
+# Zorg voor marge zodat sliders niet vastlopen
+slider_min = float(min(-5, p_min * 1.5))
+slider_max = float(max(10, p_max * 1.5))
 
 # --- OPTIMIZER FUNCTIES ---
 def calculate_metrics(sub_df, base, peak_add):
     hedge = base + (sub_df['is_peak'] * peak_add)
     prof = sub_df[p_mw_col]
     
-    # Volumes
     vol_hedge = hedge.sum() * 0.25
     vol_prof = prof.sum() * 0.25
     
-    # Over hedge calc
     diff = hedge - prof
     over_hedge_mwh = diff[diff > 0].sum() * 0.25
     
@@ -82,16 +83,10 @@ def calculate_metrics(sub_df, base, peak_add):
     return vol_hedge, vol_prof, over_pct
 
 def find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=None):
-    """
-    Zoekt de Base/Peak combinatie.
-    Correctie: target_over_pct_limit is nu optioneel (=None).
-    """
-    # 1. Simpele volume targets (Gemiddelde, 80%, 110%)
+    # 1. Simpele volume targets
     if percent_volume_target is not None:
         off_peak_mean = sub_df.loc[~sub_df['is_peak'], p_mw_col].mean()
         peak_mean = sub_df.loc[sub_df['is_peak'], p_mw_col].mean()
-        
-        # Veiligheid voor lege selecties
         if pd.isna(off_peak_mean): off_peak_mean = 0.0
         if pd.isna(peak_mean): peak_mean = 0.0
         
@@ -99,12 +94,10 @@ def find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=No
         p_add = (peak_mean * (percent_volume_target / 100.0)) - b
         return round(b, 2), round(p_add, 2)
 
-    # 2. Complexe limiet targets (0% sell, 5% sell)
+    # 2. Complexe limiet targets (Iteratief)
     best_b, best_p = 0.0, 0.0
-    
-    # We scannen van 150% dekking omlaag naar 0% in stapjes
+    # Scan van hoog naar laag
     for pct in range(150, 0, -2): 
-        # Hier ging het fout: nu werkt het omdat target_over_pct_limit optioneel is
         b_try, p_try = find_optimal_mw(sub_df, percent_volume_target=pct)
         _, _, over_pct = calculate_metrics(sub_df, b_try, p_try)
         
@@ -118,18 +111,16 @@ def find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=No
 st.sidebar.markdown("---")
 st.sidebar.header("3. Kies een Strategie")
 
-# Callback functie voor knoppen
 def apply_strategy(strat_name):
     periods = [0] if strategy_period == "Per Jaar" else [1, 2, 3, 4]
     
     for q in periods:
-        # Selecteer data
-        if q == 0: sub_df = df # Jaar
-        else: sub_df = df[df['Quarter'] == q] # Kwartaal
+        if q == 0: sub_df = df
+        else: sub_df = df[df['Quarter'] == q]
         
         # Bereken waarden
         if strat_name == "0%_sell":
-            b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1) # 0.1% marge
+            b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1)
         elif strat_name == "5%_sell":
             b, p = find_optimal_mw(sub_df, target_over_pct_limit=5.0)
         elif strat_name == "80%_cov":
@@ -138,49 +129,39 @@ def apply_strategy(strat_name):
             b, p = find_optimal_mw(sub_df, percent_volume_target=100)
         elif strat_name == "110%_cov":
             b, p = find_optimal_mw(sub_df, percent_volume_target=110)
-            
-        # Sla op in session state
-        prefix = "yr" if q == 0 else f"q{q}"
-        st.session_state['slider_values'][f"b_{prefix}"] = float(b)
-        st.session_state['slider_values'][f"p_{prefix}"] = float(p)
+        
+        # FIX: Update direct de Session State Keys van de sliders
+        if q == 0: # Jaar
+            st.session_state['slider_b_yr'] = float(b)
+            st.session_state['slider_p_yr'] = float(p)
+        else: # Kwartaal
+            st.session_state[f'slider_b_q{q}'] = float(b)
+            st.session_state[f'slider_p_q{q}'] = float(p)
 
 # De Knoppen
-col1, col2 = st.sidebar.columns(2)
-if col1.button("🛡️ 0% Sell", help="Max hedge zonder overschot"): apply_strategy("0%_sell")
-if col2.button("🎯 Max 5% Sell", help="Max hedge met max 5% overschot"): apply_strategy("5%_sell")
+c1, c2 = st.sidebar.columns(2)
+if c1.button("🛡️ 0% Sell", help="Inkoop verlagen tot verkoop nagenoeg 0 is"): apply_strategy("0%_sell")
+if c2.button("🎯 Max 5% Sell", help="Max hedge zolang verkoop < 5%"): apply_strategy("5%_sell")
 
-col3, col4 = st.sidebar.columns(2)
-if col3.button("📉 Basis 80%", help="80% Volumetrische dekking"): apply_strategy("80%_cov")
-if col4.button("⚖️ Balans 100%", help="100% Volumetrische dekking"): apply_strategy("100%_cov")
+c3, c4 = st.sidebar.columns(2)
+if c3.button("📉 Basis 80%", help="Veilige ondergrens"): apply_strategy("80%_cov")
+if c4.button("⚖️ Balans 100%", help="Gemiddeld verbruik"): apply_strategy("100%_cov")
 
 if st.sidebar.button("📈 Over-Hedge 110%", use_container_width=True): apply_strategy("110%_cov")
 
-# --- 4. Sliders (Lezen uit Session State) ---
+# --- 4. Sliders ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("4. Fine-tuning (MW)")
 
 df['Current_Hedge_MW'] = 0.0
 
-# Helper om slider te maken met default uit session state of 0
-def get_val(key, default):
-    return st.session_state['slider_values'].get(key, default)
-
-slider_min = -5.0
-slider_max = 15.0 # Ruime range
-
 if strategy_period == "Per Jaar":
-    # Defaults berekenen voor eerste keer laden
+    # Defaults alleen voor eerste keer laden
     def_b, def_p = find_optimal_mw(df, percent_volume_target=100)
     
-    val_b = get_val("b_yr", def_b)
-    val_p = get_val("p_yr", def_p)
-    
-    b_yr = st.sidebar.slider("Base (Jaar)", slider_min, slider_max, val_b, 0.1, key="slider_b_yr")
-    p_yr = st.sidebar.slider("Peak (Jaar)", slider_min, slider_max, val_p, 0.1, key="slider_p_yr")
-    
-    # Update de 'echte' waarden (als user aan slider trekt)
-    st.session_state['slider_values']["b_yr"] = b_yr
-    st.session_state['slider_values']["p_yr"] = p_yr
+    # Gebruik key zodat we deze vanuit de knoppen kunnen overschrijven
+    b_yr = st.sidebar.slider("Base (Jaar)", slider_min, slider_max, float(def_b), 0.1, key="slider_b_yr")
+    p_yr = st.sidebar.slider("Peak (Jaar)", slider_min, slider_max, float(def_p), 0.1, key="slider_p_yr")
     
     df['Current_Hedge_MW'] = b_yr + (df['is_peak'] * p_yr)
 
@@ -190,15 +171,9 @@ else: # Kwartaal
         q_mask = df['Quarter'] == q
         def_b, def_p = find_optimal_mw(df[q_mask], percent_volume_target=100)
         
-        val_b = get_val(f"b_q{q}", def_b)
-        val_p = get_val(f"p_q{q}", def_p)
-        
         c1, c2 = st.sidebar.columns(2)
-        b_q = c1.slider(f"Q{q} Base", slider_min, slider_max, val_b, 0.1, key=f"slider_b_q{q}")
-        p_q = c2.slider(f"Q{q} Peak", slider_min, slider_max, val_p, 0.1, key=f"slider_p_q{q}")
-        
-        st.session_state['slider_values'][f"b_q{q}"] = b_q
-        st.session_state['slider_values'][f"p_q{q}"] = p_q
+        b_q = c1.slider(f"Q{q} Base", slider_min, slider_max, float(def_b), 0.1, key=f"slider_b_q{q}")
+        p_q = c2.slider(f"Q{q} Peak", slider_min, slider_max, float(def_p), 0.1, key=f"slider_p_q{q}")
         
         df.loc[q_mask, 'Current_Hedge_MW'] = b_q + (df.loc[q_mask, 'is_peak'] * p_q)
 
