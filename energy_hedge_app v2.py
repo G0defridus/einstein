@@ -5,9 +5,9 @@ import altair as alt
 import os
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge Optimizer 4.0", layout="wide")
+st.set_page_config(page_title="Energy Hedge Optimizer 4.1", layout="wide")
 
-st.title("⚡ Energy Hedge Optimizer 4.0")
+st.title("⚡ Energy Hedge Optimizer 4.1")
 st.markdown("""
 Kies een automatische strategie of stel de blokken handmatig bij. 
 De optimizer berekent de ideale MW-waarden op basis van je gekozen risicoprofiel.
@@ -81,34 +81,36 @@ def calculate_metrics(sub_df, base, peak_add):
     over_pct = (over_hedge_mwh / vol_prof * 100) if vol_prof != 0 else 0
     return vol_hedge, vol_prof, over_pct
 
-def find_optimal_mw(sub_df, target_over_pct_limit, percent_volume_target=None):
+def find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=None):
     """
     Zoekt de Base/Peak combinatie.
-    Als percent_volume_target is gezet (bijv 100%), rekent hij simpelweg het gemiddelde uit.
-    Als target_over_pct_limit is gezet (bijv 5%), loopt hij een loop af om de max hedge te vinden.
+    Correctie: target_over_pct_limit is nu optioneel (=None).
     """
     # 1. Simpele volume targets (Gemiddelde, 80%, 110%)
     if percent_volume_target is not None:
         off_peak_mean = sub_df.loc[~sub_df['is_peak'], p_mw_col].mean()
         peak_mean = sub_df.loc[sub_df['is_peak'], p_mw_col].mean()
         
+        # Veiligheid voor lege selecties
+        if pd.isna(off_peak_mean): off_peak_mean = 0.0
+        if pd.isna(peak_mean): peak_mean = 0.0
+        
         b = off_peak_mean * (percent_volume_target / 100.0)
         p_add = (peak_mean * (percent_volume_target / 100.0)) - b
         return round(b, 2), round(p_add, 2)
 
     # 2. Complexe limiet targets (0% sell, 5% sell)
-    # We itereren van hoog naar laag percentage volume totdat we onder de limiet duiken
     best_b, best_p = 0.0, 0.0
     
     # We scannen van 150% dekking omlaag naar 0% in stapjes
-    # Dit is 'brute force' maar snel genoeg voor deze dataset
     for pct in range(150, 0, -2): 
+        # Hier ging het fout: nu werkt het omdat target_over_pct_limit optioneel is
         b_try, p_try = find_optimal_mw(sub_df, percent_volume_target=pct)
         _, _, over_pct = calculate_metrics(sub_df, b_try, p_try)
         
-        if over_pct <= target_over_pct_limit:
+        if target_over_pct_limit is not None and over_pct <= target_over_pct_limit:
             best_b, best_p = b_try, p_try
-            break # Gevonden! Dit is de hoogste hedge die past binnen de limiet
+            break 
             
     return best_b, best_p
 
@@ -127,17 +129,17 @@ def apply_strategy(strat_name):
         
         # Bereken waarden
         if strat_name == "0%_sell":
-            b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1) # 0.1% marge voor afronding
+            b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1) # 0.1% marge
         elif strat_name == "5%_sell":
             b, p = find_optimal_mw(sub_df, target_over_pct_limit=5.0)
         elif strat_name == "80%_cov":
-            b, p = find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=80)
+            b, p = find_optimal_mw(sub_df, percent_volume_target=80)
         elif strat_name == "100%_cov":
-            b, p = find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=100)
+            b, p = find_optimal_mw(sub_df, percent_volume_target=100)
         elif strat_name == "110%_cov":
-            b, p = find_optimal_mw(sub_df, target_over_pct_limit=None, percent_volume_target=110)
+            b, p = find_optimal_mw(sub_df, percent_volume_target=110)
             
-        # Sla op in session state (zodat sliders updaten)
+        # Sla op in session state
         prefix = "yr" if q == 0 else f"q{q}"
         st.session_state['slider_values'][f"b_{prefix}"] = float(b)
         st.session_state['slider_values'][f"p_{prefix}"] = float(p)
@@ -168,7 +170,7 @@ slider_max = 15.0 # Ruime range
 
 if strategy_period == "Per Jaar":
     # Defaults berekenen voor eerste keer laden
-    def_b, def_p = find_optimal_mw(df, target_over_pct_limit=None, percent_volume_target=100)
+    def_b, def_p = find_optimal_mw(df, percent_volume_target=100)
     
     val_b = get_val("b_yr", def_b)
     val_p = get_val("p_yr", def_p)
@@ -186,7 +188,7 @@ else: # Kwartaal
     for q in [1, 2, 3, 4]:
         st.sidebar.markdown(f"**Kwartaal {q}**")
         q_mask = df['Quarter'] == q
-        def_b, def_p = find_optimal_mw(df[q_mask], target_over_pct_limit=None, percent_volume_target=100)
+        def_b, def_p = find_optimal_mw(df[q_mask], percent_volume_target=100)
         
         val_b = get_val(f"b_q{q}", def_b)
         val_p = get_val(f"p_q{q}", def_p)
