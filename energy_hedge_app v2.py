@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import os
 
 # Pagina instellingen
 st.set_page_config(page_title="Energy Hedge Simulator 3.0", layout="wide")
@@ -13,13 +14,16 @@ Het overschot wordt apart weergegeven als percentage dat je moet terugverkopen.
 """)
 
 # --- 1. Data Laden (Inclusief Wintertijd Fix) ---
-@st.sidebar.header("1. Data Input")
+st.sidebar.header("1. Data Input")
 uploaded_file = st.sidebar.file_uploader("Upload CSV (optioneel)", type=["csv"])
 
 @st.cache_data
 def load_data(file):
     # Als er geen file is geüpload, gebruik lokaal bestand (fallback)
     if file is None:
+        # Check of lokaal bestand bestaat, anders error
+        if not os.path.exists('drie_categorien.csv'):
+            return None
         file = 'drie_categorien.csv'
     
     df = pd.read_csv(file, sep=';', decimal=',')
@@ -52,15 +56,12 @@ def load_data(file):
     return df
 
 try:
-    # Check of bestand bestaat (voor lokaal gebruik zonder upload)
-    import os
-    if uploaded_file is not None:
-        df = load_data(uploaded_file)
-    elif os.path.exists('drie_categorien.csv'):
-        df = load_data(None)
-    else:
-        st.warning("Upload een CSV bestand om te beginnen.")
+    df = load_data(uploaded_file)
+    
+    if df is None:
+        st.warning("⚠️ Upload een CSV bestand in de zijbalk om te beginnen (of zorg dat 'drie_categorien.csv' in de map staat).")
         st.stop()
+        
 except Exception as e:
     st.error(f"Fout bij laden: {e}")
     st.stop()
@@ -120,24 +121,20 @@ else:
             with c2: p_q = st.slider(f"Q{q} Peak", slider_min, slider_max, float(def_p), 0.1, key=f"p_{q}")
             df.loc[q_mask, 'Current_Hedge_MW'] = b_q + (df.loc[q_mask, 'is_peak'] * p_q)
 
-# --- 3. Resultaten & KPI's (AANGEPAST) ---
+# --- 3. Resultaten & KPI's ---
 df['Profile_MWh'] = df[p_mw_col] * 0.25
 df['Hedge_MWh'] = df['Current_Hedge_MW'] * 0.25
 
 # Verschil berekenen
 df['Diff_MWh'] = df['Hedge_MWh'] - df['Profile_MWh']
 
-# NIEUWE LOGICA:
-# 1. Effectief Gebruikt = Het minimum van wat je hebt en wat je nodig hebt
+# Effectief Gebruikt
 df['Used_Hedge_MWh'] = np.minimum(df['Hedge_MWh'], df['Profile_MWh']) 
-# (Let op: bij negatieve profielen zoals Producer werkt minimum anders, 
-# maar voor inkoop (positief) is dit correct. Voor producer (negatief) is 'gebruikt' eigenlijk 'verkocht volume gedekt'.
-# We nemen hier de absolute volumes voor de KPI's om het begrijpelijk te houden voor consument/prosumer)
 
-# 2. Over-hedge (Teveel) = Alleen als Hedge > Profile
+# Over-hedge (Teveel)
 df['Over_Hedge_MWh'] = np.maximum(0, df['Hedge_MWh'] - df['Profile_MWh'])
 
-# 3. Under-hedge (Tekort) = Alleen als Profile > Hedge
+# Under-hedge (Tekort)
 df['Under_Hedge_MWh'] = np.maximum(0, df['Profile_MWh'] - df['Hedge_MWh'])
 
 # Totalen
@@ -146,7 +143,7 @@ total_used = df['Used_Hedge_MWh'].sum()
 total_over = df['Over_Hedge_MWh'].sum()
 total_under = df['Under_Hedge_MWh'].sum()
 
-# Percentages t.o.v. Totaal Verbruik
+# Percentages
 pct_covered = (total_used / total_prof) * 100 if total_prof != 0 else 0
 pct_over = (total_over / total_prof) * 100 if total_prof != 0 else 0
 pct_under = (total_under / total_prof) * 100 if total_prof != 0 else 0
@@ -155,10 +152,10 @@ pct_under = (total_under / total_prof) * 100 if total_prof != 0 else 0
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 kpi1.metric("Effectieve Dekking", f"{pct_covered:.1f}%", help="Percentage van je verbruik dat gedekt is door de hedge.")
 kpi2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh")
-kpi3.metric("Teveel (Terugverkoop)", f"{total_over:,.0f} MWh", delta=f"{pct_over:.1f}% van verbruik", delta_color="inverse")
-kpi4.metric("Tekort (Spot Inkoop)", f"{total_under:,.0f} MWh", delta=f"{pct_under:.1f}% van verbruik", delta_color="inverse")
+kpi3.metric("Teveel (Terugverkoop)", f"{total_over:,.0f} MWh", delta=f"{pct_over:.1f}% v. verbruik", delta_color="inverse")
+kpi4.metric("Tekort (Spot Inkoop)", f"{total_under:,.0f} MWh", delta=f"{pct_under:.1f}% v. verbruik", delta_color="inverse")
 
-# --- 4. Visuele Weergave (Altair Steps) ---
+# --- 4. Visuele Weergave ---
 st.markdown("---")
 st.subheader("🔎 Seizoensanalyse (4 weken)")
 
@@ -190,7 +187,7 @@ for i, week in enumerate(weeks):
             ).properties(height=200)
             st.altair_chart(c, use_container_width=True)
 
-# --- 5. Tabel (Updated met nieuwe definities) ---
+# --- 5. Tabel ---
 st.markdown("---")
 st.subheader("📊 Kwartaal Balans")
 
