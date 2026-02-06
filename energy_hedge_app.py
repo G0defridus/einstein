@@ -145,9 +145,10 @@ kpi2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh")
 kpi3.metric("Teveel (Sell)", f"{over_mwh:,.0f} MWh", delta_color="inverse")
 kpi4.metric("Tekort (Buy)", f"{under_mwh:,.0f} MWh", delta_color="inverse")
 
-# --- 4. Visuele Weergave (4 Seizoenen) ---
+# --- 4. Visuele Weergave (Verbeterd met Altair Steps) ---
 st.markdown("---")
 st.subheader("🔎 Seizoensanalyse (4 weken)")
+import altair as alt
 
 weeks = [
     {"name": "Februari (Winter)", "start": "2025-02-03", "end": "2025-02-09"},
@@ -163,10 +164,33 @@ all_cols = r1_cols + r2_cols
 for i, week in enumerate(weeks):
     with all_cols[i]:
         st.markdown(f"**{week['name']}**")
+        
+        # Data filteren
         mask = (df['Date'] >= week['start']) & (df['Date'] <= pd.Timestamp(week['end']) + pd.Timedelta(days=1))
-        chart_data = df.loc[mask].set_index('Date')[[p_mw_col, 'Current_Hedge_MW']]
-        chart_data.columns = ['Verbruik', 'Hedge']
-        st.line_chart(chart_data, height=200)
+        chart_data = df.loc[mask].copy()
+        
+        if not chart_data.empty:
+            # Data omvormen voor Altair (Long format is makkelijker voor legenda's)
+            chart_melt = chart_data.melt(id_vars=['Date'], value_vars=[p_mw_col, 'Current_Hedge_MW'], 
+                                         var_name='Type', value_name='MW')
+            
+            # De namen wat mooier maken voor de legenda
+            chart_melt['Type'] = chart_melt['Type'].replace({p_mw_col: 'Verbruik', 'Current_Hedge_MW': 'Hedge Blok'})
+
+            # De Grafiek
+            c = alt.Chart(chart_melt).mark_line(
+                interpolate='step-after',  # DIT ZORGT VOOR DE RECHTE BLOKKEN
+                strokeWidth=2
+            ).encode(
+                x=alt.X('Date:T', axis=alt.Axis(format='%a %H:%M', title='')),
+                y=alt.Y('MW:Q', title='Vermogen (MW)'),
+                color=alt.Color('Type:N', legend=alt.Legend(title=None, orient='bottom')),
+                tooltip=['Date', 'Type', 'MW']
+            ).properties(
+                height=250
+            )
+            
+            st.altair_chart(c, use_container_width=True)
 
 # --- 5. Kwartaal Tabel (Terug van weggeweest) ---
 st.markdown("---")
