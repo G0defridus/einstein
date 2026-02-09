@@ -11,9 +11,9 @@ import altair as alt
 import os
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge & Profile Aggregator 6.0", layout="wide")
+st.set_page_config(page_title="Energy Hedge & Profile Aggregator 7.0", layout="wide")
 
-st.title("⚡ Energy Hedge & Profile Aggregator 6.0")
+st.title("⚡ Energy Hedge & Profile Aggregator 7.0")
 
 # --- DOCUMENTATIE BLOK (Inklapbaar) ---
 with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
@@ -29,9 +29,10 @@ with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", 
     We kopen in op de groothandelsmarkt in blokken van **0,1 MW**.
     * **Base:** 24/7 vast vermogen.
     * **Peak:** Extra vermogen op werkdagen (08:00 - 20:00).
+    * **Nieuw:** Je kunt nu ook kiezen voor **Total (Portfolio)** om voor de som van alle profielen in te kopen.
     
     ### 3. Definities KPI's
-    * **Effectieve Dekking:** Het deel van je verbruik dat gedekt is door de hedge. (Volume inkoop dat daadwerkelijk 'op' gaat).
+    * **Effectieve Dekking:** Het deel van je verbruik dat gedekt is door de hedge.
     * **Teveel (Sell):** Inkoop volume dat groter is dan je verbruik (dumpen op spotmarkt).
     * **Tekort (Buy):** Verbruik dat groter is dan je inkoop (bijkopen op spotmarkt).
     """)
@@ -140,6 +141,9 @@ def process_raw_connections(file):
     agg_df['Prosumer'] = df[cat_prosumer].sum(axis=1) if cat_prosumer else 0.0
     agg_df['Producer'] = df[cat_producer].sum(axis=1) if cat_producer else 0.0
     
+    # NIEUW: Totaal profiel
+    agg_df['Total'] = agg_df['Consumer'] + agg_df['Prosumer'] + agg_df['Producer']
+    
     return agg_df, final_mapping
 
 # --- DEEL 2: HEDGE OPTIMIZER ---
@@ -162,7 +166,7 @@ if uploaded_file is not None:
                 c1.metric("Consumers", counts.get('Consumer', 0), help="Aansluitingen met weinig tot geen zonne-opwek.")
                 c2.metric("Prosumers", counts.get('Prosumer', 0), help="Aansluitingen met opwek, maar ook significant netto verbruik.")
                 c3.metric("Producers", counts.get('Producer', 0), help="Aansluitingen die netto terugleveren (bijv. zonneparken).")
-                st.caption("De data is nu samengevoegd tot 3 groepsprofielen. Hieronder kun je de inkoopstrategie bepalen.")
+                st.caption("Data is samengevoegd tot 3 profielen + 1 Totaalprofiel.")
 
             df_hedge = df_agg.reset_index()
             cols = list(df_hedge.columns)
@@ -186,9 +190,19 @@ if uploaded_file is not None:
                 if not renamed:
                     cols = list(df_hedge.columns); cols[0] = 'Date'; df_hedge.columns = cols
 
-            for col in ['Consumer', 'Prosumer', 'Producer']:
+            # Cleaning numeriek (Nu ook voor Total als die er al in staat)
+            for col in ['Consumer', 'Prosumer', 'Producer', 'Total']:
                 if col in df_hedge.columns:
                     df_hedge[col] = pd.to_numeric(df_hedge[col].astype(str).str.replace(',', '.'), errors='coerce')
+            
+            # Als Total niet bestaat, maak hem aan
+            if 'Total' not in df_hedge.columns:
+                cols_to_sum = [c for c in ['Consumer', 'Prosumer', 'Producer'] if c in df_hedge.columns]
+                if cols_to_sum:
+                    df_hedge['Total'] = df_hedge[cols_to_sum].sum(axis=1)
+                else:
+                    df_hedge['Total'] = 0.0
+
             df_hedge['Date'] = pd.to_datetime(df_hedge['Date'], dayfirst=True)
             
         except Exception as e:
@@ -205,7 +219,8 @@ if df_hedge is not None:
     df = df.drop_duplicates(subset='Date', keep='first')
     df = df.set_index('Date').asfreq('15min').ffill().reset_index()
 
-    for col in ['Consumer', 'Prosumer', 'Producer']:
+    # MW Calc (Inclusief Total)
+    for col in ['Consumer', 'Prosumer', 'Producer', 'Total']:
         if col in df.columns: df[f'{col}_MW'] = (df[col] * 4) / 1000
         else: df[f'{col}_MW'] = 0.0
     
@@ -216,7 +231,8 @@ if df_hedge is not None:
     st.sidebar.markdown("---")
     st.sidebar.header("2. Hedge Configuratie")
     
-    profile_choice = st.sidebar.selectbox("Kies Profiel", ["Consumer", "Prosumer", "Producer"])
+    # NIEUW: Total toegevoegd aan de lijst
+    profile_choice = st.sidebar.selectbox("Kies Profiel", ["Consumer", "Prosumer", "Producer", "Total"])
     strategy_period = st.sidebar.radio("Periode", ["Per Jaar", "Per Kwartaal"])
     p_mw_col = f'{profile_choice}_MW'
 
@@ -293,7 +309,14 @@ if df_hedge is not None:
     st.sidebar.subheader("4. Fine-tuning (MW)")
     
     df['Current_Hedge_MW'] = 0.0
-    slider_min, slider_max = -10.0, 25.0 
+    # Dynamische range bepalen zodat sliders ook werken voor Producer (negatief) of Total (groot)
+    curr_min = df[p_mw_col].min()
+    curr_max = df[p_mw_col].max()
+    slider_min = float(np.floor(curr_min * 1.5 - 1))
+    slider_max = float(np.ceil(curr_max * 1.5 + 1))
+    
+    # Zekerheidje voor als alles 0 is
+    if slider_max < slider_min: slider_max = slider_min + 10.0
 
     if strategy_period == "Per Jaar":
         if 'slider_b_yr' not in st.session_state:
@@ -326,11 +349,15 @@ if df_hedge is not None:
     total_prof = df['Profile_MWh'].sum()
     total_over = df['Over_Hedge_MWh'].sum()
     total_under = df['Under_Hedge_MWh'].sum()
-    pct_over = (total_over / total_prof) * 100 if total_prof != 0 else 0
-    pct_under = (total_under / total_prof) * 100 if total_prof != 0 else 0
+    
+    # Vermijd delen door nul
+    denom = total_prof if total_prof != 0 else 1.0
+    
+    pct_over = (total_over / denom) * 100 
+    pct_under = (total_under / denom) * 100
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Effectieve Dekking", f"{(df['Used_Hedge_MWh'].sum()/total_prof)*100:.1f}%", help="Hoeveel % van je verbruik kwam rechtstreeks uit de inkoopblokken?")
+    k1.metric("Effectieve Dekking", f"{(df['Used_Hedge_MWh'].sum()/denom)*100:.1f}%", help="Hoeveel % van je verbruik kwam rechtstreeks uit de inkoopblokken?")
     k2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh", help="Totaal jaarvolume van dit profiel.")
     k3.metric("Teveel (Sell)", f"{total_over:,.0f} MWh", f"{pct_over:.1f}%", delta_color="inverse", help="Volume dat is ingekocht maar niet verbruikt (moet terugverkocht worden).")
     k4.metric("Tekort (Buy)", f"{total_under:,.0f} MWh", f"{pct_under:.1f}%", delta_color="inverse", help="Volume dat niet gedekt was door blokken (moet bijgekocht worden op spot).")
