@@ -11,15 +11,15 @@ import altair as alt
 import os
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge & Profile Aggregator 5.0", layout="wide")
+st.set_page_config(page_title="Energy Hedge & Profile Aggregator 5.1", layout="wide")
 
-st.title("⚡ Energy Hedge & Profile Aggregator 5.0")
+st.title("⚡ Energy Hedge & Profile Aggregator 5.1")
 st.markdown("""
 **Stap 1:** Upload ruwe meetdata (individuele aansluitingen). De app categoriseert en aggregeert deze automatisch.
 **Stap 2:** Bepaal je inkoopstrategie op de berekende groepsprofielen.
 """)
 
-# --- DEEL 1: LOGICA VOOR CATEGORISEREN & AGGRGEREN ---
+# --- DEEL 1: LOGICA VOOR CATEGORISEREN & AGGREGEREN ---
 
 def calculate_winter_profile(df):
     # Wintermaanden: Jan (1), Nov (11), Dec (12)
@@ -30,100 +30,81 @@ def calculate_winter_profile(df):
     if winter_df.empty:
         return df.groupby(df.index.time).mean()
     
-    # FIX: Gebruik de index van de subset (winter_df) en niet de hele dataset (df)
+    # FIX (v5.0): Gebruik de index van de subset om Grouper error te voorkomen
     return winter_df.groupby(winter_df.index.time).mean()
 
 def estimate_gross_solar_robust(df, connection_col, winter_profile):
     col_data = df[connection_col]
     w_prof = winter_profile[connection_col]
     
-    # Nachtverbruik bepalen (tussen 23:00 en 06:00)
+    # Nachtverbruik bepalen
     night_mask = (df.index.hour < 6) | (df.index.hour >= 23)
-    
-    # Resample naar dagelijks gemiddelde nachtverbruik
     daily_night_avg = df.loc[night_mask, connection_col].resample('D').mean()
     
-    # Basis nachtverbruik uit winterprofiel
+    # Basis nachtverbruik
     night_times = [t for t in w_prof.index if t.hour < 6 or t.hour >= 23]
     base_night_avg = w_prof.loc[night_times].mean()
     if base_night_avg < 0.05: base_night_avg = 0.05
     
-    # Scaling factor berekenen
+    # Scaling
     daily_scaling = daily_night_avg / base_night_avg
     daily_scaling = daily_scaling.clip(0.2, 5.0)
     
-    # Uitrollen naar 15-minuten data
+    # Uitrollen naar kwartieren
     dates = pd.Series(df.index.normalize(), index=df.index)
     scaling_series = dates.map(daily_scaling).ffill().bfill()
     
-    # Verwacht verbruik (Base Load)
-    # We mappen het tijdstip (bijv 14:15) naar de waarde in het winterprofiel
+    # Base Load
     base_load_series = df.index.map(lambda x: w_prof.loc[x.time()]) 
     base_load_series = pd.Series(base_load_series, index=df.index)
-    
     expected_load = base_load_series * scaling_series
     
-    # Zonne-energie 'achter de meter'
+    # Solar calc
     solar_behind_meter = expected_load - col_data
     is_daylight = (df.index.hour >= 8) & (df.index.hour <= 20)
-    
-    # Alleen overdag en positief
     solar_behind_meter = solar_behind_meter.where(is_daylight, 0).clip(lower=0)
     
-    # Totale productie = Achter de meter + Teruglevering (negatieve waarden in data)
     actual_export = col_data.clip(upper=0).abs()
     return solar_behind_meter + actual_export
 
 @st.cache_data
 def process_raw_connections(file):
-    # 1. Inlezen
+    # Inlezen
     try:
-        # Probeer eerst met index_col=0 als datum
         df = pd.read_csv(file, sep=';', decimal=',', index_col=0, parse_dates=True, dayfirst=True)
-        # Check of index echt datetime is, anders fallback
-        if not isinstance(df.index, pd.DatetimeIndex):
-             raise ValueError("Index is geen datum")
+        if not isinstance(df.index, pd.DatetimeIndex): raise ValueError
     except:
-        # Fallback: lees gewoon in en zoek de datum kolom
         df = pd.read_csv(file, sep=';', decimal=',')
-        # Neem aan dat de eerste kolom de datum is
         df['Date'] = pd.to_datetime(df.iloc[:, 0], dayfirst=True)
         df = df.set_index('Date')
 
-    # Alleen numerieke kolommen overhouden
     df = df.select_dtypes(include=[np.number])
-    
-    # Winterprofiel maken
     winter_profile = calculate_winter_profile(df)
     
     connection_cols = df.columns
     estimated_volumes = {}
     gross_prod_dict = {}
     
-    # Progress bar
-    progress_text = "Analyseren aansluitingen..."
-    my_bar = st.progress(0, text=progress_text)
+    # Progress
+    my_bar = st.progress(0, text="Analyseren aansluitingen...")
     total_cols = len(connection_cols)
     
-    # 2. Bruto Productie & Categorisatie
+    # Bruto Productie
     for i, col in enumerate(connection_cols):
         gross_series = estimate_gross_solar_robust(df, col, winter_profile)
         gross_prod_dict[col] = gross_series
         estimated_volumes[col] = gross_series.sum()
-        
-        # Update bar elke 10% om de UI niet te vertragen
         if i % max(1, int(total_cols/10)) == 0:
             my_bar.progress((i + 1) / total_cols, text=f"Analyseren: {col}")
-    
     my_bar.empty()
     
     gross_production_df = pd.DataFrame(gross_prod_dict, index=df.index)
     
-    # Eerste slag categorisatie
+    # Categorisatie 1
     categories = {}
     for col in connection_cols:
         gross_vol = estimated_volumes[col]
-        if gross_vol > 1000: # Drempelwaarde
+        if gross_vol > 1000: 
             total_import = df[col][df[col] > 0].sum()
             if total_import < 0.2 * gross_vol:
                 categories[col] = 'Producer'
@@ -132,33 +113,29 @@ def process_raw_connections(file):
         else:
             categories[col] = 'Consumer'
             
-    # 3. Verfijning (Correlatie)
+    # Verfijning
     hours = np.arange(24)
     solar_curve_ideal = np.exp(-((hours - 13)**2) / (2 * 2.5**2))
     solar_curve_ideal[hours < 6] = 0
     solar_curve_ideal[hours > 21] = 0
     
     final_mapping = {}
-    
     for col in connection_cols:
         cat = categories[col]
         if cat == 'Prosumer':
             daily_avg = gross_production_df[col].groupby(gross_production_df[col].index.hour).mean()
             daily_avg = daily_avg.reindex(range(24), fill_value=0)
             
+            corr = 0
             if np.std(daily_avg) > 0 and np.std(solar_curve_ideal) > 0:
                 corr = np.corrcoef(daily_avg, solar_curve_ideal)[0, 1]
-            else:
-                corr = 0
             
-            if corr < 0.85:
-                final_mapping[col] = 'Consumer'
-            else:
-                final_mapping[col] = 'Prosumer'
+            if corr < 0.85: final_mapping[col] = 'Consumer'
+            else: final_mapping[col] = 'Prosumer'
         else:
             final_mapping[col] = cat
             
-    # 4. Aggregatie
+    # Aggregatie
     cat_consumer = [c for c, cat in final_mapping.items() if cat == 'Consumer']
     cat_prosumer = [c for c, cat in final_mapping.items() if cat == 'Prosumer']
     cat_producer = [c for c, cat in final_mapping.items() if cat == 'Producer']
@@ -184,18 +161,20 @@ if uploaded_file is not None:
         try:
             df_agg, mapping = process_raw_connections(uploaded_file)
             
-            # Stats tonen
+            # Stats
             counts = pd.Series(mapping.values()).value_counts()
             c1, c2, c3 = st.columns(3)
             c1.metric("Consumers", counts.get('Consumer', 0))
             c2.metric("Prosumers", counts.get('Prosumer', 0))
             c3.metric("Producers", counts.get('Producer', 0))
             
-            # Klaarzetten voor hedge module
-            df_hedge = df_agg.reset_index().rename(columns={'index': 'Date'})
-            if 'Date' not in df_hedge.columns: 
-                df_hedge.columns.values[0] = 'Date'
-                
+            # FIX v5.1: Robuuste rename van index naar 'Date'
+            df_hedge = df_agg.reset_index()
+            # Hernoem de eerste kolom (de oude index) hard naar 'Date'
+            cols = list(df_hedge.columns)
+            cols[0] = 'Date'
+            df_hedge.columns = cols
+
         except Exception as e:
             st.error(f"Fout bij verwerken ruwe data: {e}")
             st.stop()
@@ -203,18 +182,42 @@ if uploaded_file is not None:
     else: # Reeds geaggregeerd
         try:
             df_hedge = pd.read_csv(uploaded_file, sep=';', decimal=',')
+            
+            # FIX v5.1: Check of 'Date' bestaat, zo niet, zoek alternatieven
+            if 'Date' not in df_hedge.columns:
+                candidates = ['Datum', 'Tijd', 'Time', 'date', 'time']
+                renamed = False
+                for c in candidates:
+                    if c in df_hedge.columns:
+                        df_hedge.rename(columns={c: 'Date'}, inplace=True)
+                        renamed = True
+                        break
+                if not renamed:
+                    # Fallback: neem de eerste kolom als datum
+                    cols = list(df_hedge.columns)
+                    cols[0] = 'Date'
+                    df_hedge.columns = cols
+
+            # Cleaning numeriek
             for col in ['Consumer', 'Prosumer', 'Producer']:
                 if col in df_hedge.columns:
                     df_hedge[col] = pd.to_numeric(df_hedge[col].astype(str).str.replace(',', '.'), errors='coerce')
+            
             df_hedge['Date'] = pd.to_datetime(df_hedge['Date'], dayfirst=True)
+            
         except Exception as e:
             st.error(f"Fout bij inlezen geaggregeerd bestand: {e}")
             st.stop()
 
-# Hedge Logic Start
+# Hedge Logic
 if df_hedge is not None:
     # Voorbereiding Data
     df = df_hedge.copy()
+    
+    # FIX v5.1: Zeker weten dat 'Date' datetime is voor sorteren
+    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+        df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
+
     df = df.sort_values('Date')
     df = df.drop_duplicates(subset='Date', keep='first')
     df = df.set_index('Date').asfreq('15min').ffill().reset_index()
@@ -237,7 +240,6 @@ if df_hedge is not None:
     strategy_period = st.sidebar.radio("Periode", ["Per Jaar", "Per Kwartaal"])
     p_mw_col = f'{profile_choice}_MW'
 
-    # Session State voor sliders
     if 'slider_values' not in st.session_state: st.session_state['slider_values'] = {}
 
     # --- OPTIMIZER FUNCTIES ---
@@ -263,7 +265,6 @@ if df_hedge is not None:
             return b, p_add
 
         best_b, best_p = 0.0, 0.0
-        # Scan van hoog naar laag
         for pct in range(150, 0, -1): 
             b_try, p_try = find_optimal_mw(sub_df, percent_volume_target=pct)
             _, _, over_pct = calculate_metrics(sub_df, b_try, p_try)
@@ -295,11 +296,9 @@ if df_hedge is not None:
     c1, c2 = st.sidebar.columns(2)
     if c1.button("🛡️ 0% Sell"): apply_strategy("0%_sell")
     if c2.button("🎯 Max 5% Sell"): apply_strategy("5%_sell")
-    
     c3, c4 = st.sidebar.columns(2)
     if c3.button("📉 Basis 80%"): apply_strategy("80%_cov")
     if c4.button("⚖️ Balans 100%"): apply_strategy("100%_cov")
-
     if st.sidebar.button("📈 Over-Hedge 110%", use_container_width=True): apply_strategy("110%_cov")
 
     # --- SLIDERS ---
@@ -363,11 +362,9 @@ if df_hedge is not None:
     for i, week in enumerate(weeks):
         with cols[i]:
             st.caption(week['name'])
-            # Datum check om errors te voorkomen als 2025 data mist
             if df['Date'].min() > pd.Timestamp(week['end']) or df['Date'].max() < pd.Timestamp(week['start']):
                 st.info("Geen data in deze periode")
                 continue
-                
             mask = (df['Date'] >= week['start']) & (df['Date'] <= pd.Timestamp(week['end']) + pd.Timedelta(days=1))
             chart_data = df.loc[mask].melt(id_vars=['Date'], value_vars=[p_mw_col, 'Current_Hedge_MW'], var_name='Type', value_name='MW')
             chart_data['Type'] = chart_data['Type'].replace({p_mw_col: 'Verbruik', 'Current_Hedge_MW': 'Hedge'})
@@ -377,7 +374,6 @@ if df_hedge is not None:
             ).properties(height=180)
             st.altair_chart(c, use_container_width=True)
 
-    # Download
     csv_dl = df.to_csv(index=False).encode('utf-8')
     st.download_button("📥 Download Resultaten (CSV)", csv_dl, "hedge_resultaten.csv", "text/csv")
 else:
