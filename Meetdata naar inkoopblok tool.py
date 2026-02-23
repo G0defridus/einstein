@@ -1,44 +1,81 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Feb  9 08:21:48 2026
-
-@author: FritsMaas
-"""
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import os
+import requests
+import xml.etree.ElementTree as ET
+from datetime import timedelta
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge & Profile Aggregator 7.0", layout="wide")
+st.set_page_config(page_title="Energy Hedge & Financial Optimizer 8.0", layout="wide")
 
-st.title("⚡ Energy Hedge & Profile Aggregator 7.0")
+st.title("⚡ Energy Hedge & Financial Optimizer 8.0")
 
-# --- DOCUMENTATIE BLOK (Inklapbaar) ---
-with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
-    st.markdown("""
-    ### 1. Van Ruwe Data naar Profiel
-    Het model analyseert slimme meter data om te bepalen of een aansluiting een **Consumer**, **Prosumer** of **Producer** is.
-    * **Stap 1 (Winterprofiel):** We kijken naar Jan/Nov/Dec om het basisverbruik zonder zonne-invloed te bepalen.
-    * **Stap 2 (Zon Detectie):** We vergelijken de zomer met de winter. Het verschil tussen verwacht verbruik en werkelijk verbruik is de (bruto) zonne-opwek.
-    * **Stap 3 (Beslisboom):** * *Opwek > 1000 kWh?* Nee → Consumer. Ja → Check netto import.
-        * *Netto import < 20% van opwek?* Ja → Producer. Nee → Prosumer.
+# --- ENTSO-E API FUNCTIES ---
+@st.cache_data
+def fetch_entsoe_prices(api_key, start_date, end_date, area_code="10YNL31N1001A590"):
+    """
+    Haalt Day-Ahead Prices op van ENTSO-E API.
+    Area Code default = NL (10YNL31N1001A590)
+    """
+    # Datums formatteren voor API (YYYYMMDDHHMM)
+    # We vragen iets ruimere periode op om tijdzone issues te dekken
+    period_start = (start_date - timedelta(days=1)).strftime('%Y%m%d0000')
+    period_end = (end_date + timedelta(days=1)).strftime('%Y%m%d2300')
     
-    ### 2. Hedge Strategie
-    We kopen in op de groothandelsmarkt in blokken van **0,1 MW**.
-    * **Base:** 24/7 vast vermogen.
-    * **Peak:** Extra vermogen op werkdagen (08:00 - 20:00).
-    * **Nieuw:** Je kunt nu ook kiezen voor **Total (Portfolio)** om voor de som van alle profielen in te kopen.
+    url = "https://web-api.tp.entsoe.eu/api"
+    params = {
+        "securityToken": api_key,
+        "documentType": "A44",  # Price Document
+        "in_Domain": area_code,
+        "out_Domain": area_code,
+        "periodStart": period_start,
+        "periodEnd": period_end
+    }
     
-    ### 3. Definities KPI's
-    * **Effectieve Dekking:** Het deel van je verbruik dat gedekt is door de hedge.
-    * **Teveel (Sell):** Inkoop volume dat groter is dan je verbruik (dumpen op spotmarkt).
-    * **Tekort (Buy):** Verbruik dat groter is dan je inkoop (bijkopen op spotmarkt).
-    """)
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            return None, f"HTTP Error {response.status_code}"
+        
+        # XML Parsen
+        root = ET.fromstring(response.content)
+        ns = {'ns': 'urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:0'}
+        
+        prices = []
+        for time_series in root.findall('.//ns:TimeSeries', ns):
+            # Check resolutie (moet PT60M zijn voor day-ahead, soms kwartier)
+            # Voor nu gaan we uit van standaard uurprijzen
+            start_str = time_series.find('.//ns:timeInterval/ns:start', ns).text
+            start_dt = pd.to_datetime(start_str)
+            
+            for point in time_series.findall('.//ns:Point', ns):
+                position = int(point.find('ns:position', ns).text)
+                price = float(point.find('ns:price.amount', ns).text)
+                
+                # Tijdstip berekenen (Positie 1 = starttijd)
+                # Let op: dit is vaak UTC
+                point_time = start_dt + timedelta(hours=position-1)
+                prices.append({'Date': point_time, 'EPEX_Price': price})
+                
+        if not prices:
+            return None, "Geen prijzen gevonden in XML."
+            
+        df_prices = pd.DataFrame(prices)
+        df_prices['Date'] = pd.to_datetime(df_prices['Date'], utc=True)
+        
+        # Omzetten naar lokale tijd (Europe/Amsterdam) en indexeren
+        df_prices = df_prices.set_index('Date').dt.tz_convert('Europe/Amsterdam').tz_localize(None)
+        
+        # Resamplen naar kwartieren (Forward Fill: uurprijs geldt voor 4 kwartieren)
+        df_prices = df_prices.resample('15min').ffill()
+        
+        return df_prices, None
+        
+    except Exception as e:
+        return None, str(e)
 
-# --- DEEL 1: LOGICA ---
-
+# --- DEEL 1: PROFIEL LOGICA ---
 def calculate_winter_profile(df):
     winter_mask = df.index.month.isin([1, 11, 12])
     winter_df = df[winter_mask]
@@ -126,7 +163,6 @@ def process_raw_connections(file):
             corr = 0
             if np.std(daily_avg) > 0 and np.std(solar_curve_ideal) > 0:
                 corr = np.corrcoef(daily_avg, solar_curve_ideal)[0, 1]
-            
             if corr < 0.85: final_mapping[col] = 'Consumer'
             else: final_mapping[col] = 'Prosumer'
         else:
@@ -140,13 +176,11 @@ def process_raw_connections(file):
     agg_df['Consumer'] = df[cat_consumer].sum(axis=1) if cat_consumer else 0.0
     agg_df['Prosumer'] = df[cat_prosumer].sum(axis=1) if cat_prosumer else 0.0
     agg_df['Producer'] = df[cat_producer].sum(axis=1) if cat_producer else 0.0
-    
-    # NIEUW: Totaal profiel
     agg_df['Total'] = agg_df['Consumer'] + agg_df['Prosumer'] + agg_df['Producer']
     
     return agg_df, final_mapping
 
-# --- DEEL 2: HEDGE OPTIMIZER ---
+# --- DEEL 2: GUI & LOGIC ---
 
 st.sidebar.header("1. Data Input")
 input_mode = st.sidebar.radio("Input Type", ["Ruwe Aansluitingen (CSV)", "Reeds Geaggregeerd (CSV)"])
@@ -158,68 +192,39 @@ if uploaded_file is not None:
     if input_mode == "Ruwe Aansluitingen (CSV)":
         try:
             df_agg, mapping = process_raw_connections(uploaded_file)
-            
-            # --- UITLEG BLOK CATEGORISATIE ---
-            with st.expander("ℹ️ Resultaat Analyse & Categorisatie (Klik voor details)", expanded=True):
+            with st.expander("ℹ️ Resultaat Analyse", expanded=True):
                 c1, c2, c3 = st.columns(3)
                 counts = pd.Series(mapping.values()).value_counts()
-                c1.metric("Consumers", counts.get('Consumer', 0), help="Aansluitingen met weinig tot geen zonne-opwek.")
-                c2.metric("Prosumers", counts.get('Prosumer', 0), help="Aansluitingen met opwek, maar ook significant netto verbruik.")
-                c3.metric("Producers", counts.get('Producer', 0), help="Aansluitingen die netto terugleveren (bijv. zonneparken).")
-                st.caption("Data is samengevoegd tot 3 profielen + 1 Totaalprofiel.")
-
+                c1.metric("Consumers", counts.get('Consumer', 0))
+                c2.metric("Prosumers", counts.get('Prosumer', 0))
+                c3.metric("Producers", counts.get('Producer', 0))
             df_hedge = df_agg.reset_index()
-            cols = list(df_hedge.columns)
-            cols[0] = 'Date'
-            df_hedge.columns = cols
-
+            cols = list(df_hedge.columns); cols[0] = 'Date'; df_hedge.columns = cols
         except Exception as e:
-            st.error(f"Fout bij verwerken ruwe data: {e}")
+            st.error(f"Fout: {e}")
             st.stop()
-            
-    else: # Reeds geaggregeerd
+    else: 
         try:
             df_hedge = pd.read_csv(uploaded_file, sep=';', decimal=',')
             if 'Date' not in df_hedge.columns:
-                candidates = ['Datum', 'Tijd', 'Time', 'date', 'time']
-                renamed = False
-                for c in candidates:
-                    if c in df_hedge.columns:
-                        df_hedge.rename(columns={c: 'Date'}, inplace=True)
-                        renamed = True; break
-                if not renamed:
-                    cols = list(df_hedge.columns); cols[0] = 'Date'; df_hedge.columns = cols
-
-            # Cleaning numeriek (Nu ook voor Total als die er al in staat)
+                cols = list(df_hedge.columns); cols[0] = 'Date'; df_hedge.columns = cols
             for col in ['Consumer', 'Prosumer', 'Producer', 'Total']:
                 if col in df_hedge.columns:
                     df_hedge[col] = pd.to_numeric(df_hedge[col].astype(str).str.replace(',', '.'), errors='coerce')
-            
-            # Als Total niet bestaat, maak hem aan
             if 'Total' not in df_hedge.columns:
                 cols_to_sum = [c for c in ['Consumer', 'Prosumer', 'Producer'] if c in df_hedge.columns]
-                if cols_to_sum:
-                    df_hedge['Total'] = df_hedge[cols_to_sum].sum(axis=1)
-                else:
-                    df_hedge['Total'] = 0.0
-
+                df_hedge['Total'] = df_hedge[cols_to_sum].sum(axis=1) if cols_to_sum else 0.0
             df_hedge['Date'] = pd.to_datetime(df_hedge['Date'], dayfirst=True)
-            
         except Exception as e:
-            st.error(f"Fout bij inlezen bestand: {e}")
+            st.error(f"Fout: {e}")
             st.stop()
 
-# Hedge Logic
 if df_hedge is not None:
     df = df_hedge.copy()
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
         df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
+    df = df.sort_values('Date').drop_duplicates('Date').set_index('Date').asfreq('15min').ffill().reset_index()
 
-    df = df.sort_values('Date')
-    df = df.drop_duplicates(subset='Date', keep='first')
-    df = df.set_index('Date').asfreq('15min').ffill().reset_index()
-
-    # MW Calc (Inclusief Total)
     for col in ['Consumer', 'Prosumer', 'Producer', 'Total']:
         if col in df.columns: df[f'{col}_MW'] = (df[col] * 4) / 1000
         else: df[f'{col}_MW'] = 0.0
@@ -227,17 +232,80 @@ if df_hedge is not None:
     df['is_peak'] = (df['Date'].dt.weekday < 5) & (df['Date'].dt.hour >= 8) & (df['Date'].dt.hour < 20)
     df['Quarter'] = df['Date'].dt.quarter
 
+    # --- API SECTIE ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("2. Financiële Data (ENTSO-E)")
+    
+    api_key = st.sidebar.text_input("API Key", value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
+    use_ref_year = st.sidebar.checkbox("Forceer referentiejaar 2024?", value=False, help="Vink aan als je 2025 data hebt maar nog geen EPEX prijzen bestaan.")
+    
+    # Prijzen ophalen
+    start_date = df['Date'].min()
+    end_date = df['Date'].max()
+    
+    # Logic voor referentiejaar (als data in toekomst ligt)
+    if use_ref_year or start_date.year > pd.Timestamp.now().year:
+        fetch_start = start_date.replace(year=2024)
+        fetch_end = end_date.replace(year=2024)
+        st.sidebar.info(f"Ophalen prijzen 2024 ({fetch_start.date()} - {fetch_end.date()}) en projecteren op dataset.")
+    else:
+        fetch_start = start_date
+        fetch_end = end_date
+    
+    if 'epex_prices' not in st.session_state:
+        st.session_state['epex_prices'] = None
+
+    if st.sidebar.button("🔄 Haal EPEX Prijzen op"):
+        with st.spinner("Verbinding maken met ENTSO-E..."):
+            prices, error = fetch_entsoe_prices(api_key, fetch_start, fetch_end)
+            if prices is not None:
+                st.session_state['epex_prices'] = prices
+                st.sidebar.success("Prijzen opgehaald!")
+            else:
+                st.sidebar.error(f"Fout: {error}")
+
+    # Merge Prijzen
+    df_fin = df.copy()
+    if st.session_state['epex_prices'] is not None:
+        prices = st.session_state['epex_prices'].copy()
+        
+        # Als we referentiejaar gebruiken, moeten we de 'prices' index verschuiven naar het jaar van de dataset
+        if use_ref_year or start_date.year > pd.Timestamp.now().year:
+            # Verschuif prijzen van 2024 terug naar het jaar van de dataset (bijv 2025)
+            # Simpele manier: vervang jaar in index
+            target_year = start_date.year
+            # Let op schrikkeljaren: dit is 'tricky', we doen een eenvoudige merge op maand-dag-tijd
+            prices['MatchKey'] = prices.index.strftime('%m-%d %H:%M')
+            df_fin['MatchKey'] = df_fin['Date'].dt.strftime('%m-%d %H:%M')
+            
+            # Alleen de prijs kolom mergen
+            df_fin = pd.merge(df_fin, prices[['EPEX_Price', 'MatchKey']], on='MatchKey', how='left')
+        else:
+            # Gewoon op datum mergen
+            df_fin = pd.merge(df_fin, prices[['EPEX_Price']], left_on='Date', right_index=True, how='left')
+            
+        # Vul gaten (bijv. zomertijd)
+        df_fin['EPEX_Price'] = df_fin['EPEX_Price'].fillna(method='ffill').fillna(80.0) # Fallback 80 euro
+    else:
+        df_fin['EPEX_Price'] = 80.0 # Default dummy prijs
+
     # --- HEDGE CONFIG ---
     st.sidebar.markdown("---")
-    st.sidebar.header("2. Hedge Configuratie")
+    st.sidebar.header("3. Hedge & Prijzen")
     
-    # NIEUW: Total toegevoegd aan de lijst
     profile_choice = st.sidebar.selectbox("Kies Profiel", ["Consumer", "Prosumer", "Producer", "Total"])
     strategy_period = st.sidebar.radio("Periode", ["Per Jaar", "Per Kwartaal"])
     p_mw_col = f'{profile_choice}_MW'
 
+    # Financiële Inputs
+    st.sidebar.markdown("**Hedge Prijzen (Forward)**")
+    c_h1, c_h2 = st.sidebar.columns(2)
+    price_base = c_h1.number_input("Base Prijs (€/MWh)", value=100.0, step=5.0)
+    price_peak = c_h2.number_input("Peak Prijs (€/MWh)", value=120.0, step=5.0)
+
     if 'slider_values' not in st.session_state: st.session_state['slider_values'] = {}
 
+    # --- CALC FUNCTIES ---
     def calculate_metrics(sub_df, base, peak_add):
         hedge = base + (sub_df['is_peak'] * peak_add)
         prof = sub_df[p_mw_col]
@@ -257,7 +325,6 @@ if df_hedge is not None:
             b = round(off_peak_mean * (percent_volume_target / 100.0), 1)
             p_add = round((peak_mean * (percent_volume_target / 100.0)) - b, 1)
             return b, p_add
-
         best_b, best_p = 0.0, 0.0
         for pct in range(150, 0, -1): 
             b_try, p_try = find_optimal_mw(sub_df, percent_volume_target=pct)
@@ -268,125 +335,128 @@ if df_hedge is not None:
         return best_b, best_p
 
     # --- STRATEGIE KNOPPEN ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("3. Kies Strategie")
-
     def apply_strategy(strat_name):
         periods = [0] if strategy_period == "Per Jaar" else [1, 2, 3, 4]
         for q in periods:
-            sub_df = df if q == 0 else df[df['Quarter'] == q]
+            sub_df = df_fin if q == 0 else df_fin[df_fin['Quarter'] == q]
             if strat_name == "0%_sell": b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1)
             elif strat_name == "5%_sell": b, p = find_optimal_mw(sub_df, target_over_pct_limit=5.0)
             elif strat_name == "80%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=80)
             elif strat_name == "100%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=100)
             elif strat_name == "110%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=110)
-            
             key_b = f'slider_b_yr' if q == 0 else f'slider_b_q{q}'
             key_p = f'slider_p_yr' if q == 0 else f'slider_p_q{q}'
             st.session_state[key_b] = float(b)
             st.session_state[key_p] = float(p)
 
+    st.sidebar.markdown("Kies Strategie:")
     c1, c2 = st.sidebar.columns(2)
-    if c1.button("🛡️ 0% Sell", help="Zoekt de maximale hedge waarbij je (vrijwel) NOOIT teveel hebt ingekocht."): apply_strategy("0%_sell")
-    if c2.button("🎯 Max 5% Sell", help="Maximaliseert de hedge, maar stopt als het overschot boven de 5% komt."): apply_strategy("5%_sell")
+    if c1.button("🛡️ 0% Sell"): apply_strategy("0%_sell")
+    if c2.button("🎯 Max 5% Sell"): apply_strategy("5%_sell")
     c3, c4 = st.sidebar.columns(2)
-    if c3.button("📉 Basis 80%", help="Dekt standaard 80% van het gemiddelde verbruik af."): apply_strategy("80%_cov")
-    if c4.button("⚖️ Balans 100%", help="Dekt precies 100% van het gemiddelde volume (salderen)."): apply_strategy("100%_cov")
-    if st.sidebar.button("📈 Over-Hedge 110%", help="Koopt bewust 10% teveel in (voor als je prijsstijging verwacht).", use_container_width=True): apply_strategy("110%_cov")
-
-    # --- UITLEG OPTIMIZER (Inklapbaar) ---
-    with st.sidebar.expander("🧠 Hoe werkt de Optimizer?", expanded=False):
-        st.caption("""
-        De optimizer gebruikt een **Grid Search**:
-        1. Hij begint met een heel hoge inkoop.
-        2. Hij berekent hoeveel stroom je dan moet 'weggooien' (Over-hedge).
-        3. Hij verlaagt de inkoop stapje voor stapje (in 0,1 MW).
-        4. Zodra de 'verspilling' onder jouw gekozen limiet (bijv. 5%) komt, stopt hij.
-        """)
+    if c3.button("📉 Basis 80%"): apply_strategy("80%_cov")
+    if c4.button("⚖️ Balans 100%"): apply_strategy("100%_cov")
+    if st.sidebar.button("📈 Over-Hedge 110%", use_container_width=True): apply_strategy("110%_cov")
 
     # --- SLIDERS ---
     st.sidebar.markdown("---")
-    st.sidebar.subheader("4. Fine-tuning (MW)")
-    
-    df['Current_Hedge_MW'] = 0.0
-    # Dynamische range bepalen zodat sliders ook werken voor Producer (negatief) of Total (groot)
-    curr_min = df[p_mw_col].min()
-    curr_max = df[p_mw_col].max()
-    slider_min = float(np.floor(curr_min * 1.5 - 1))
-    slider_max = float(np.ceil(curr_max * 1.5 + 1))
-    
-    # Zekerheidje voor als alles 0 is
+    df_fin['Current_Hedge_MW'] = 0.0
+    curr_min = df_fin[p_mw_col].min(); curr_max = df_fin[p_mw_col].max()
+    slider_min = float(np.floor(curr_min * 1.5 - 1)); slider_max = float(np.ceil(curr_max * 1.5 + 1))
     if slider_max < slider_min: slider_max = slider_min + 10.0
 
     if strategy_period == "Per Jaar":
         if 'slider_b_yr' not in st.session_state:
-            def_b, def_p = find_optimal_mw(df, percent_volume_target=100)
+            def_b, def_p = find_optimal_mw(df_fin, percent_volume_target=100)
             st.session_state['slider_b_yr'] = float(def_b); st.session_state['slider_p_yr'] = float(def_p)
-            
-        b_yr = st.sidebar.slider("Base (Jaar)", slider_min, slider_max, key="slider_b_yr", step=0.1, help="Vast vermogen 24/7")
-        p_yr = st.sidebar.slider("Peak (Jaar)", slider_min, slider_max, key="slider_p_yr", step=0.1, help="Extra vermogen werkdagen 08-20u")
-        df['Current_Hedge_MW'] = b_yr + (df['is_peak'] * p_yr)
+        b_yr = st.sidebar.slider("Base (Jaar)", slider_min, slider_max, key="slider_b_yr", step=0.1)
+        p_yr = st.sidebar.slider("Peak (Jaar)", slider_min, slider_max, key="slider_p_yr", step=0.1)
+        df_fin['Current_Hedge_MW'] = b_yr + (df_fin['is_peak'] * p_yr)
     else:
         for q in [1, 2, 3, 4]:
             st.sidebar.markdown(f"**Kwartaal {q}**")
-            q_mask = df['Quarter'] == q
+            q_mask = df_fin['Quarter'] == q
             if f'slider_b_q{q}' not in st.session_state:
-                def_b, def_p = find_optimal_mw(df[q_mask], percent_volume_target=100)
+                def_b, def_p = find_optimal_mw(df_fin[q_mask], percent_volume_target=100)
                 st.session_state[f'slider_b_q{q}'] = float(def_b); st.session_state[f'slider_p_q{q}'] = float(def_p)
-            
             c1, c2 = st.sidebar.columns(2)
             b_q = c1.slider(f"Q{q} Base", slider_min, slider_max, key=f"slider_b_q{q}", step=0.1)
             p_q = c2.slider(f"Q{q} Peak", slider_min, slider_max, key=f"slider_p_q{q}", step=0.1)
-            df.loc[q_mask, 'Current_Hedge_MW'] = b_q + (df.loc[q_mask, 'is_peak'] * p_q)
+            df_fin.loc[q_mask, 'Current_Hedge_MW'] = b_q + (df_fin.loc[q_mask, 'is_peak'] * p_q)
 
-    # --- RESULTATEN DASHBOARD ---
-    df['Profile_MWh'] = df[p_mw_col] * 0.25
-    df['Hedge_MWh'] = df['Current_Hedge_MW'] * 0.25
-    df['Used_Hedge_MWh'] = np.minimum(df['Hedge_MWh'], df['Profile_MWh']) 
-    df['Over_Hedge_MWh'] = np.maximum(0, df['Hedge_MWh'] - df['Profile_MWh'])
-    df['Under_Hedge_MWh'] = np.maximum(0, df['Profile_MWh'] - df['Hedge_MWh'])
-
-    total_prof = df['Profile_MWh'].sum()
-    total_over = df['Over_Hedge_MWh'].sum()
-    total_under = df['Under_Hedge_MWh'].sum()
+    # --- FINANCIËLE BEREKENING ---
+    df_fin['Profile_MWh'] = df_fin[p_mw_col] * 0.25
+    df_fin['Hedge_MWh'] = df_fin['Current_Hedge_MW'] * 0.25
     
-    # Vermijd delen door nul
-    denom = total_prof if total_prof != 0 else 1.0
+    # Kosten Hedge (Fixed Price)
+    # We moeten weten wat Base en wat Peak volume is voor de prijs
+    # Base Volume = Base MW * 0.25 (elk kwartier)
+    # Peak Volume = Peak MW * 0.25 (alleen tijdens peak uren)
     
-    pct_over = (total_over / denom) * 100 
-    pct_under = (total_under / denom) * 100
+    # Omdat sliders dynamisch zijn per kwartaal, moeten we itereren of slim vectoriseren
+    # Voor nu (versimpeld): We nemen aan dat Current_Hedge_MW correct is opgebouwd
+    # We moeten de Base en Peak MW componenten weten om de prijs toe te passen.
+    # Trucje: Als is_peak False is, is alles Base. Als True, is Base de waarde van de niet-peak uren (of slider).
+    # Beter: we reconstrueren de Base/Peak volumes uit de sliders.
+    
+    # We maken hulpkolommen 'Hedge_Base_MW' en 'Hedge_Peak_MW'
+    df_fin['Hedge_Base_MW'] = 0.0
+    df_fin['Hedge_Peak_MW'] = 0.0
+    
+    if strategy_period == "Per Jaar":
+        df_fin['Hedge_Base_MW'] = st.session_state['slider_b_yr']
+        df_fin['Hedge_Peak_MW'] = np.where(df_fin['is_peak'], st.session_state['slider_p_yr'], 0.0)
+    else:
+        for q in [1, 2, 3, 4]:
+            q_mask = df_fin['Quarter'] == q
+            df_fin.loc[q_mask, 'Hedge_Base_MW'] = st.session_state[f'slider_b_q{q}']
+            df_fin.loc[q_mask & df_fin['is_peak'], 'Hedge_Peak_MW'] = st.session_state[f'slider_p_q{q}']
+            
+    df_fin['Cost_Hedge'] = (df_fin['Hedge_Base_MW'] * 0.25 * price_base) + (df_fin['Hedge_Peak_MW'] * 0.25 * price_peak)
+    
+    # Kosten Spot (Unhedged)
+    # Restprofiel = Verbruik - Hedge
+    # Positief = Tekort (Kopen tegen EPEX)
+    # Negatief = Overschot (Verkopen tegen EPEX)
+    df_fin['Residual_MWh'] = df_fin['Profile_MWh'] - df_fin['Hedge_MWh']
+    df_fin['Cost_Spot'] = df_fin['Residual_MWh'] * df_fin['EPEX_Price']
+    
+    df_fin['Total_Cost'] = df_fin['Cost_Hedge'] + df_fin['Cost_Spot']
+    
+    # KPI's
+    total_prof = df_fin['Profile_MWh'].sum()
+    total_cost = df_fin['Total_Cost'].sum()
+    avg_price = total_cost / total_prof if total_prof != 0 else 0
+    spot_exposure = df_fin['Cost_Spot'].sum()
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Effectieve Dekking", f"{(df['Used_Hedge_MWh'].sum()/denom)*100:.1f}%", help="Hoeveel % van je verbruik kwam rechtstreeks uit de inkoopblokken?")
-    k2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh", help="Totaal jaarvolume van dit profiel.")
-    k3.metric("Teveel (Sell)", f"{total_over:,.0f} MWh", f"{pct_over:.1f}%", delta_color="inverse", help="Volume dat is ingekocht maar niet verbruikt (moet terugverkocht worden).")
-    k4.metric("Tekort (Buy)", f"{total_under:,.0f} MWh", f"{pct_under:.1f}%", delta_color="inverse", help="Volume dat niet gedekt was door blokken (moet bijgekocht worden op spot).")
+    st.subheader("💰 Financiële Impact")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Totale Energiekosten", f"€ {total_cost:,.0f}")
+    col2.metric("Gem. Prijs (All-in)", f"€ {avg_price:.2f} /MWh")
+    col3.metric("Kosten uit Hedge", f"€ {df_fin['Cost_Hedge'].sum():,.0f}", help="Vaste kosten o.b.v. Base/Peak prijzen.")
+    col4.metric("Spot Resultaat (Rest)", f"€ {spot_exposure:,.0f}", delta_color="inverse", help="Kosten/Opbrengsten van het restprofiel op de EPEX.")
 
+    # Grafieken
     st.markdown("---")
-    st.subheader("🔎 Seizoensanalyse")
-    weeks = [
-        {"name": "Februari", "start": "2025-02-03", "end": "2025-02-09"},
-        {"name": "Mei",       "start": "2025-05-05", "end": "2025-05-11"},
-        {"name": "Augustus",  "start": "2025-08-04", "end": "2025-08-10"},
-        {"name": "November", "start": "2025-11-03", "end": "2025-11-09"}
-    ]
-    cols = st.columns(2) + st.columns(2)
-    for i, week in enumerate(weeks):
-        with cols[i]:
-            st.caption(week['name'])
-            if df['Date'].min() > pd.Timestamp(week['end']) or df['Date'].max() < pd.Timestamp(week['start']):
-                st.info("Geen data")
-                continue
-            mask = (df['Date'] >= week['start']) & (df['Date'] <= pd.Timestamp(week['end']) + pd.Timedelta(days=1))
-            chart_data = df.loc[mask].melt(id_vars=['Date'], value_vars=[p_mw_col, 'Current_Hedge_MW'], var_name='Type', value_name='MW')
-            chart_data['Type'] = chart_data['Type'].replace({p_mw_col: 'Verbruik', 'Current_Hedge_MW': 'Hedge'})
-            c = alt.Chart(chart_data).mark_line(interpolate='step-after').encode(
-                x=alt.X('Date:T', axis=alt.Axis(format='%a %H:%M', title=None)),
-                y=alt.Y('MW:Q', title=None), color=alt.Color('Type:N', legend=alt.Legend(orient='bottom', title=None))
-            ).properties(height=180)
-            st.altair_chart(c, use_container_width=True)
+    tab1, tab2 = st.tabs(["⚡ Volumes & Hedge", "💶 Kosten & Spot"])
+    
+    with tab1:
+        st.caption("Blauw = Verbruik | Oranje = Hedge Blokken")
+        chart_vol = alt.Chart(df_fin.melt(id_vars=['Date'], value_vars=[p_mw_col, 'Current_Hedge_MW'], var_name='Type', value_name='MW')).mark_line(interpolate='step-after').encode(
+            x='Date:T', y='MW:Q', color='Type:N'
+        ).properties(height=300)
+        st.altair_chart(chart_vol, use_container_width=True)
+        
+    with tab2:
+        st.caption("Grijze lijn = EPEX Prijs | Rode vlakken = Spot Kosten | Groene vlakken = Spot Opbrengst")
+        # Voor visualisatie aggregeren we even naar dag, anders wordt het traag/lelijk
+        df_day = df_fin.resample('D', on='Date').agg({'Cost_Spot': 'sum', 'EPEX_Price': 'mean'}).reset_index()
+        
+        base = alt.Chart(df_day).encode(x='Date:T')
+        bar = base.mark_bar().encode(y='Cost_Spot:Q', color=alt.condition(alt.datum.Cost_Spot > 0, alt.value("red"), alt.value("green")))
+        line = base.mark_line(color='gray').encode(y='EPEX_Price:Q')
+        
+        st.altair_chart((bar + line).resolve_scale(y='independent'), use_container_width=True)
 
-    csv_dl = df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Resultaten (CSV)", csv_dl, "hedge_resultaten.csv", "text/csv")
 else:
     st.info("👆 Upload een bestand om te beginnen.")
