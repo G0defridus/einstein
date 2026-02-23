@@ -12,7 +12,7 @@ st.title("⚡ Energy Hedge Optimizer 8.3")
 with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
     st.markdown("""
     ### 1. Van Ruwe Data naar Profiel
-    Het model analyseert slimme meter data om te bepalen of een aansluiting een **Consumer**, **Prosumer** of **Producer** is.
+    Het model analyseert slimme meter data om te bepalen of een aansluiting een **Consumer**, **Prosumer** of **Producer**.
     * **Stap 1 (Winterprofiel):** We kijken naar Jan/Nov/Dec om het basisverbruik te bepalen.
     * **Stap 2 (Zon Detectie):** We vergelijken de zomer met de winter. Het verschil is de bruto zonne-opwek.
     * **Stap 3 (Beslisboom):** Op basis van ratio's wordt de aansluiting toegekend aan een profiel.
@@ -331,21 +331,30 @@ if df_hedge is not None:
     st.sidebar.markdown("---")
     st.sidebar.header("6. Financiële Module (Spotmarkt EPEX)")
     use_epex = st.sidebar.checkbox("Laad Spotprijzen in via ENTSO-E", value=False)
-    api_key = st.secrets["ENTSOE_API_KEY"], value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
+    
+    # Veilige afhandeling van de API Key
+    default_api_key = ""
+    if "ENTSOE_API_KEY" in st.secrets:
+        default_api_key = st.secrets["ENTSOE_API_KEY"]
+        
+    api_key = st.sidebar.text_input("ENTSO-E API Key", value=default_api_key, type="password")
     
     epex_loaded = False
     if use_epex:
-        start_dt = df['Date'].min()
-        end_dt = df['Date'].max()
-        df_epex = fetch_epex_prices(api_key, start_dt, end_dt)
-        
-        if isinstance(df_epex, str):
-            st.sidebar.error(f"⚠️ Fout bij ophalen EPEX: Zorg dat je 'entsoe-py' aan je requirements.txt hebt toegevoegd. Details: {df_epex}")
+        if not api_key:
+            st.sidebar.warning("Vul een geldige ENTSO-E API Key in (of stel deze in via Streamlit Secrets).")
         else:
-            df['Date_Hour'] = df['Date'].dt.floor('H')
-            df = pd.merge(df, df_epex[['Date_Hour', 'EPEX_EUR_MWh']], on='Date_Hour', how='left')
-            epex_loaded = True
-            st.sidebar.success("EPEX Prijzen succesvol gekoppeld!")
+            start_dt = df['Date'].min()
+            end_dt = df['Date'].max()
+            df_epex = fetch_epex_prices(api_key, start_dt, end_dt)
+            
+            if isinstance(df_epex, str):
+                st.sidebar.error(f"⚠️ Fout bij ophalen EPEX: Controleer de API Key en zorg dat 'entsoe-py' in requirements.txt staat. Details: {df_epex}")
+            else:
+                df['Date_Hour'] = df['Date'].dt.floor('H')
+                df = pd.merge(df, df_epex[['Date_Hour', 'EPEX_EUR_MWh']], on='Date_Hour', how='left')
+                epex_loaded = True
+                st.sidebar.success("EPEX Prijzen succesvol gekoppeld!")
 
     if not epex_loaded:
         df['EPEX_EUR_MWh'] = 0.0
@@ -407,7 +416,7 @@ if df_hedge is not None:
         f1.metric("Kosten Inkoopblokken", f"€ {tot_hedge_eur:,.0f}", help="Vaste inkoopkosten o.b.v. de ingestelde prijzen in de zijbalk.")
         gem_blok = tot_hedge_eur / df['Hedge_MWh'].sum() if df['Hedge_MWh'].sum() > 0 else 0
         f2.metric("Gemiddelde Blokprijs", f"€ {gem_blok:.2f} / MWh")
-        st.info("💡 Zet de EPEX Spotprijzen aan in de zijbalk om je volledige integrale kostprijs te berekenen.")
+        st.info("💡 Zet de EPEX Spotprijzen aan in de zijbalk om je volledige integrale kostprijs te bereken.")
 
     st.markdown("---")
     st.subheader("🔎 Seizoensanalyse (4 Representatieve Weken)")
