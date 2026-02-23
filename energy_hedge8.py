@@ -332,18 +332,13 @@ if df_hedge is not None:
     st.sidebar.header("6. Financiële Module (Spotmarkt EPEX)")
     use_epex = st.sidebar.checkbox("Laad Spotprijzen in via ENTSO-E", value=False)
     
-    # Veilige afhandeling van de API Key
-    default_api_key = ""
-    if "ENTSOE_API_KEY" in st.secrets:
-        default_api_key = st.secrets["ENTSOE_API_KEY"]
-        
-    api_key = st.sidebar.text_input("ENTSO-E API Key", value=default_api_key, type="password")
-    
     epex_loaded = False
     if use_epex:
-        if not api_key:
-            st.sidebar.warning("Vul een geldige ENTSO-E API Key in (of stel deze in via Streamlit Secrets).")
+        # Haal de sleutel ONZICHTBAAR op de achtergrond op
+        if "ENTSOE_API_KEY" not in st.secrets:
+            st.sidebar.error("⚠️ Systeemconfiguratiefout: ENTSO-E API Key ontbreekt in de server instellingen (.streamlit/secrets.toml).")
         else:
+            api_key = st.secrets["ENTSOE_API_KEY"]
             start_dt = df['Date'].min()
             end_dt = df['Date'].max()
             df_epex = fetch_epex_prices(api_key, start_dt, end_dt)
@@ -354,7 +349,7 @@ if df_hedge is not None:
                 df['Date_Hour'] = df['Date'].dt.floor('H')
                 df = pd.merge(df, df_epex[['Date_Hour', 'EPEX_EUR_MWh']], on='Date_Hour', how='left')
                 epex_loaded = True
-                st.sidebar.success("EPEX Prijzen succesvol gekoppeld!")
+                st.sidebar.success("EPEX Prijzen succesvol op de achtergrond gekoppeld!")
 
     if not epex_loaded:
         df['EPEX_EUR_MWh'] = 0.0
@@ -397,8 +392,6 @@ if df_hedge is not None:
         f1, f2, f3, f4 = st.columns(4)
         
         net_spot_eur = df['Net_Spot_EUR'].sum()
-        # Totale kosten = Vaste Blokken MINUS Netto Spot Resultaat
-        # (Als spot netto geld oplevert, verlaagt dit je kosten. Als spot geld kost, verhoogt dit de kosten)
         tot_energy_cost = tot_hedge_eur - net_spot_eur 
         
         f1.metric("Kosten Inkoopblokken", f"€ {tot_hedge_eur:,.0f}", help="Vaste inkoopkosten o.b.v. de ingestelde prijzen in de zijbalk.")
