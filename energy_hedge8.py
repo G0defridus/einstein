@@ -4,9 +4,9 @@ import numpy as np
 import altair as alt
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge Optimizer 8.3 (incl. Prijzen & EPEX)", layout="wide")
+st.set_page_config(page_title="Energy Hedge Optimizer 8.4", layout="wide")
 
-st.title("⚡ Energy Hedge Optimizer 8.3")
+st.title("⚡ Energy Hedge Optimizer 8.4")
 
 # --- DOCUMENTATIE BLOK (Inklapbaar) ---
 with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
@@ -239,32 +239,43 @@ if df_hedge is not None:
                 break 
         return best_b, best_p
 
-    # Knoppen
+    # --- NIEUW: STRATEGIE BLOK MET 3 KNOPPEN & SLIDER ---
     st.sidebar.markdown("---")
     st.sidebar.header("3. Kies Strategie")
 
-    def apply_strategy(strat_name):
+    def apply_strategy(strat_name, custom_pct=None):
         periods = [0] if strategy_period == "Per Jaar" else [1, 2, 3, 4]
         for q in periods:
             sub_df = df if q == 0 else df[df['Quarter'] == q]
-            if strat_name == "0%_sell": b, p = find_optimal_mw(sub_df, target_over_pct_limit=0.1)
-            elif strat_name == "5%_sell": b, p = find_optimal_mw(sub_df, target_over_pct_limit=5.0)
-            elif strat_name == "80%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=80)
+            if strat_name == "5%_sell": b, p = find_optimal_mw(sub_df, target_over_pct_limit=5.0)
+            elif strat_name == "10%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=10)
             elif strat_name == "100%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=100)
-            elif strat_name == "110%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=110)
+            elif strat_name == "custom_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=custom_pct)
             
+            # Sla de uitkomst op in de session state zodat de MW sliders in blok 4 geüpdatet worden
             st.session_state[f'slider_b_yr' if q == 0 else f'slider_b_q{q}'] = float(b)
             st.session_state[f'slider_p_yr' if q == 0 else f'slider_p_q{q}'] = float(p)
 
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("🛡️ 0% Sell"): apply_strategy("0%_sell")
-    if c2.button("🎯 Max 5% Sell"): apply_strategy("5%_sell")
-    c3, c4 = st.sidebar.columns(2)
-    if c3.button("📉 Basis 80%"): apply_strategy("80%_cov")
-    if c4.button("⚖️ Balans 100%"): apply_strategy("100%_cov")
-    if st.sidebar.button("📈 Over-Hedge 110%", use_container_width=True): apply_strategy("110%_cov")
+    def on_custom_hedge_change():
+        # Wordt aangeroepen zodra de gebruiker de "% Hedge" slider versleept
+        apply_strategy("custom_cov", custom_pct=st.session_state.custom_hedge_pct)
 
-    # Sliders MW
+    # De 3 hoofd knoppen
+    c1, c2, c3 = st.sidebar.columns(3)
+    if c1.button("🎯 Max 5% Sell"): apply_strategy("5%_sell")
+    if c2.button("📉 10% Hedge"): apply_strategy("10%_cov")
+    if c3.button("⚖️ 100% Hedge"): apply_strategy("100%_cov")
+
+    # De Custom Percentage Slider
+    st.sidebar.slider(
+        "% Hedge op Volume", 
+        min_value=0, max_value=150, value=100, step=1, 
+        key="custom_hedge_pct", 
+        on_change=on_custom_hedge_change,
+        help="Versleep deze slider om de dekking aan te passen. De Base & Peak volumes (MW) worden direct geüpdatet."
+    )
+
+    # --- Sliders MW (Fine-Tuning) ---
     st.sidebar.markdown("---")
     st.sidebar.subheader("4. Fine-tuning Volumes (MW)")
     
