@@ -2,11 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import os
+import glob
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge Optimizer 8.4", layout="wide")
+st.set_page_config(page_title="Energy Hedge Optimizer 8.5", layout="wide")
 
-st.title("⚡ Energy Hedge Optimizer 8.4")
+st.title("⚡ Energy Hedge Optimizer 8.5")
 
 # --- DOCUMENTATIE BLOK (Inklapbaar) ---
 with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
@@ -239,7 +241,7 @@ if df_hedge is not None:
                 break 
         return best_b, best_p
 
-    # --- NIEUW: STRATEGIE BLOK MET 3 KNOPPEN & SLIDER ---
+    # --- STRATEGIE BLOK ---
     st.sidebar.markdown("---")
     st.sidebar.header("3. Kies Strategie")
 
@@ -252,21 +254,17 @@ if df_hedge is not None:
             elif strat_name == "100%_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=100)
             elif strat_name == "custom_cov": b, p = find_optimal_mw(sub_df, percent_volume_target=custom_pct)
             
-            # Sla de uitkomst op in de session state zodat de MW sliders in blok 4 geüpdatet worden
             st.session_state[f'slider_b_yr' if q == 0 else f'slider_b_q{q}'] = float(b)
             st.session_state[f'slider_p_yr' if q == 0 else f'slider_p_q{q}'] = float(p)
 
     def on_custom_hedge_change():
-        # Wordt aangeroepen zodra de gebruiker de "% Hedge" slider versleept
         apply_strategy("custom_cov", custom_pct=st.session_state.custom_hedge_pct)
 
-    # De 3 hoofd knoppen
     c1, c2, c3 = st.sidebar.columns(3)
     if c1.button("🎯 Max 5% Sell"): apply_strategy("5%_sell")
     if c2.button("📉 10% Hedge"): apply_strategy("10%_cov")
     if c3.button("⚖️ 100% Hedge"): apply_strategy("100%_cov")
 
-    # De Custom Percentage Slider
     st.sidebar.slider(
         "% Hedge op Volume", 
         min_value=0, max_value=150, value=100, step=1, 
@@ -315,7 +313,82 @@ if df_hedge is not None:
             
     df['Current_Hedge_MW'] = df['Hedge_Base_MW'] + df['Hedge_Peak_MW']
 
-    # --- NIEUW: CONTRACTPRIJZEN BLOKKEN ---
+    # --- HELPER: ROBUUSTE ENDEX EXTRACTIE ---
+    @st.cache_data
+    def get_default_price(period="Jaar", q=None):
+        # 1. Fallback realistische waarden (o.b.v. profiel 2024-2025)
+        b_val, p_val = 80.0, 95.0
+        if period == "Kwartaal":
+            if q == 1: b_val, p_val = 90.0, 110.0
+            elif q == 2: b_val, p_val = 65.0, 75.0
+            elif q == 3: b_val, p_val = 70.0, 80.0
+            elif q == 4: b_val, p_val = 85.0, 105.0
+
+        try:
+            # 2. Zoek dynamisch naar de juiste CSV file lokaal of in mappen
+            if period == "Jaar":
+                files = glob.glob("**/*jaar*endex*.csv", recursive=True) + glob.glob("**/*endex*jaar*.csv", recursive=True)
+            else:
+                files = glob.glob("**/*kwartaal*endex*.csv", recursive=True) + glob.glob("**/*endex*kwartaal*.csv", recursive=True)
+                
+            if not files: # Laatste redmiddel als glob faalt
+                files = [f for f in os.listdir('.') if period.lower() in f.lower() and 'endex' in f.lower() and f.endswith('.csv')]
+                
+            if files:
+                # ICE ENDEX export bevat 2 header rijen (CAL-x erboven). We checken dit en slaan rij 0 over als nodig.
+                with open(files[0], 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                
+                skip = 0
+                if len(lines) > 1 and "Date" in lines[1] and "Base" in lines[1]:
+                    skip = 1
+                    
+                df_px = pd.read_csv(files[0], sep=';', skiprows=skip)
+                
+                # Zorg dat de komma's punten worden (NL formaat)
+                for c in df_px.columns:
+                    if df_px[c].dtype == object:
+                        df_px[c] = df_px[c].astype(str).str.replace(',', '.')
+
+                # Identificeer de base en peak kolommen (P16hrs is ENDEX term voor Peak)
+                base_cols = [c for c in df_px.columns if 'base' in c.lower()]
+                peak_cols = [c for c in df_px.columns if 'p16' in c.lower() or 'peak' in c.lower()]
+                
+                # Omdat er meerdere verhandelde contracten in 1 file staan (CAL-25, CAL-26 etc)
+                # Doorzoeken we ze van rechts naar links om de meest actuele, liquide data te vinden
+                if base_cols and peak_cols:
+                    found_b, found_p = False, False
+                    for bc in reversed(base_cols):
+                        s = pd.to_numeric(df_px[bc], errors='coerce').dropna()
+                        if len(s) > 10:  # Moet enigszins liquide zijn
+                            b_val = float(s.iloc[-1])
+                            found_b = True
+                            break
+                            
+                    for pc in reversed(peak_cols):
+                        s = pd.to_numeric(df_px[pc], errors='coerce').dropna()
+                        if len(s) > 10:
+                            p_val = float(s.iloc[-1])
+                            found_p = True
+                            break
+                            
+                    # Als we in de kwartaal file zitten en het kwartaal kunnen matchen
+                    if period == "Kwartaal" and found_b and found_p:
+                        # Bereken de seizoensfactor o.b.v de fallbacks om de gevonden actuele prijs bij te schaven
+                        # (Zodat Q2 logischerwijs goedkoper blijft dan Q1 als we de specifieke Q niet kunnen parsen)
+                        gem_b = (90+65+70+85)/4
+                        gem_p = (110+75+80+105)/4
+                        if q == 1: b_val *= (90/gem_b); p_val *= (110/gem_p)
+                        elif q == 2: b_val *= (65/gem_b); p_val *= (75/gem_p)
+                        elif q == 3: b_val *= (70/gem_b); p_val *= (80/gem_p)
+                        elif q == 4: b_val *= (85/gem_b); p_val *= (105/gem_p)
+                        
+        except Exception as e:
+            pass # Als er wat dan ook mis gaat, faal geruisloos en gebruik de veilige fallbacks
+            
+        return round(b_val, 2), round(p_val, 2)
+
+    # --- CONTRACTPRIJZEN BLOKKEN (MET AUTOMATISCHE PRE-FILLS) ---
     st.sidebar.markdown("---")
     st.sidebar.subheader("5. Contractprijzen (Inkoopblokken)")
     
@@ -324,16 +397,18 @@ if df_hedge is not None:
     
     if strategy_period == "Per Jaar":
         cp1, cp2 = st.sidebar.columns(2)
-        pr_b = cp1.number_input("Base Prijs (€/MWh)", value=80.0, step=1.0)
-        pr_p = cp2.number_input("Peak Prijs (€/MWh)", value=100.0, step=1.0)
+        def_b, def_p = get_default_price("Jaar")
+        pr_b = cp1.number_input("Base Prijs (€/MWh)", value=def_b, step=1.0)
+        pr_p = cp2.number_input("Peak Prijs (€/MWh)", value=def_p, step=1.0)
         df['Price_Base'] = pr_b
         df['Price_Peak'] = pr_p
     else:
         for q in [1, 2, 3, 4]:
             st.sidebar.markdown(f"**Prijzen Q{q}**")
             cp1, cp2 = st.sidebar.columns(2)
-            pr_b = cp1.number_input(f"Q{q} Base (€/MWh)", value=80.0, step=1.0, key=f"pr_b_q{q}")
-            pr_p = cp2.number_input(f"Q{q} Peak (€/MWh)", value=100.0, step=1.0, key=f"pr_p_q{q}")
+            def_b, def_p = get_default_price("Kwartaal", q)
+            pr_b = cp1.number_input(f"Q{q} Base (€/MWh)", value=def_b, step=1.0, key=f"pr_b_q{q}")
+            pr_p = cp2.number_input(f"Q{q} Peak (€/MWh)", value=def_p, step=1.0, key=f"pr_p_q{q}")
             q_mask = df['Quarter'] == q
             df.loc[q_mask, 'Price_Base'] = pr_b
             df.loc[q_mask, 'Price_Peak'] = pr_p
@@ -345,7 +420,6 @@ if df_hedge is not None:
     
     epex_loaded = False
     if use_epex:
-        # Haal de sleutel ONZICHTBAAR op de achtergrond op
         if "ENTSOE_API_KEY" not in st.secrets:
             st.sidebar.error("⚠️ Systeemconfiguratiefout: ENTSO-E API Key ontbreekt in de server instellingen (.streamlit/secrets.toml).")
         else:
