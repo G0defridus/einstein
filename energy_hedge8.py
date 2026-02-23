@@ -331,7 +331,7 @@ if df_hedge is not None:
     st.sidebar.markdown("---")
     st.sidebar.header("6. Financiële Module (Spotmarkt EPEX)")
     use_epex = st.sidebar.checkbox("Laad Spotprijzen in via ENTSO-E", value=False)
-    api_key = st.sidebar.text_input("ENTSO-E API Key", value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
+    api_key = st.secrets["ENTSOE_API_KEY"], value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
     
     epex_loaded = False
     if use_epex:
