@@ -1,36 +1,12 @@
-import sys
-import subprocess
-import os
-
-# --- AUTO-INSTALLER ---
-# Dit blok controleert of alle benodigde packages geïnstalleerd zijn.
-# Zo niet, dan installeert hij ze automatisch via pip op de achtergrond.
-REQUIRED_PACKAGES = {
-    "streamlit": "streamlit",
-    "pandas": "pandas",
-    "numpy": "numpy",
-    "altair": "altair",
-    "entsoe": "entsoe-py"
-}
-
-for module_name, pip_name in REQUIRED_PACKAGES.items():
-    try:
-        __import__(module_name)
-    except ImportError:
-        print(f"⏳ Module '{module_name}' ontbreekt. Bezig met automatisch installeren van '{pip_name}'...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
-        print(f"✅ '{pip_name}' succesvol geïnstalleerd!")
-
-# Nu we zeker weten dat alles er is, kunnen we veilig importeren:
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 
 # Pagina instellingen
-st.set_page_config(page_title="Energy Hedge Optimizer 8.1 (incl. EPEX)", layout="wide")
+st.set_page_config(page_title="Energy Hedge Optimizer 8.3 (incl. Prijzen & EPEX)", layout="wide")
 
-st.title("⚡ Energy Hedge Optimizer 8.1")
+st.title("⚡ Energy Hedge Optimizer 8.3")
 
 # --- DOCUMENTATIE BLOK (Inklapbaar) ---
 with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", expanded=False):
@@ -47,14 +23,13 @@ with st.expander("📘 Lees mij: Achtergrond en Methodiek (Klik om te openen)", 
     * **Peak:** Extra vermogen op werkdagen (08:00 - 20:00).
     * **Total:** Inkoop voor het samengestelde portfolio-profiel (salderen).
     
-    ### 3. Financiële Waardering (EPEX)
-    Via de ENTSO-E API wordt de **Day-Ahead Spotprijs (EPEX)** opgehaald.
-    * **Spot Inkoop (Kosten):** Volume dat je tekort komt (Under-hedge) × EPEX prijs.
-    * **Spot Verkoop (Opbrengst):** Volume dat je over hebt (Over-hedge) × EPEX prijs. Let op: bij negatieve prijzen kost verkopen geld!
-    * **Netto Spot Resultaat:** Verkoopopbrengst - Inkoopkosten. (Positief = je verdient aan de spotmarkt, Negatief = je betaalt bij op de spotmarkt).
+    ### 3. Financiële Waardering (Blokken & Spot)
+    * **Blokken:** Je vult je vaste contractprijzen in voor de Base- en Peak-blokken. Dit bepaalt je vaste kosten.
+    * **Spotmarkt (EPEX):** Via de ENTSO-E API wordt de Day-Ahead prijs ingeladen. Tekorten (Under-hedge) worden tegen deze prijs ingekocht, overschotten (Over-hedge) worden tegen deze prijs verkocht.
+    * **Totale Energiekosten:** Kosten Blokken - Netto Spot Resultaat. Dit geeft de daadwerkelijke integrale MWh-prijs over het jaar.
     """)
 
-# --- DEEL 1: LOGICA ---
+# --- DEEL 1: LOGICA VOOR CATEGORISATIE ---
 def calculate_winter_profile(df):
     winter_mask = df.index.month.isin([1, 11, 12])
     winter_df = df[winter_mask]
@@ -165,7 +140,7 @@ def fetch_epex_prices(api_key, start_date, end_date):
     except Exception as e:
         return str(e)
 
-# --- DEEL 2: HEDGE OPTIMIZER UI ---
+# --- DEEL 2: UI & DATA PREP ---
 st.sidebar.header("1. Data Input")
 input_mode = st.sidebar.radio("Input Type", ["Ruwe Aansluitingen (CSV)", "Reeds Geaggregeerd (CSV)"])
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
@@ -176,7 +151,7 @@ if uploaded_file is not None:
     if input_mode == "Ruwe Aansluitingen (CSV)":
         try:
             df_agg, mapping = process_raw_connections(uploaded_file)
-            with st.expander("ℹ️ Resultaat Analyse & Categorisatie (Klik voor details)", expanded=True):
+            with st.expander("ℹ️ Resultaat Analyse & Categorisatie", expanded=True):
                 c1, c2, c3 = st.columns(3)
                 counts = pd.Series(mapping.values()).value_counts()
                 c1.metric("Consumers", counts.get('Consumer', 0))
@@ -214,7 +189,7 @@ if uploaded_file is not None:
             st.error(f"Fout bij inlezen bestand: {e}")
             st.stop()
 
-# Hedge Logic
+# --- HEDGE LOGICA & BEREKENINGEN ---
 if df_hedge is not None:
     df = df_hedge.copy()
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
@@ -235,30 +210,6 @@ if df_hedge is not None:
     profile_choice = st.sidebar.selectbox("Kies Profiel", ["Consumer", "Prosumer", "Producer", "Total"])
     strategy_period = st.sidebar.radio("Periode", ["Per Jaar", "Per Kwartaal"])
     p_mw_col = f'{profile_choice}_MW'
-
-    # --- ENTSO-E INPUT ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("5. Financiële Module (EPEX)")
-    use_epex = st.sidebar.checkbox("Laad Spotprijzen in via ENTSO-E", value=False)
-    api_key = st.sidebar.text_input("ENTSO-E API Key", value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
-    
-    epex_loaded = False
-    if use_epex:
-        start_dt = df['Date'].min()
-        end_dt = df['Date'].max()
-        df_epex = fetch_epex_prices(api_key, start_dt, end_dt)
-        
-        if isinstance(df_epex, str):
-            st.sidebar.error(f"⚠️ Fout bij ophalen EPEX: {df_epex}")
-            use_epex = False
-        else:
-            df['Date_Hour'] = df['Date'].dt.floor('H')
-            df = pd.merge(df, df_epex[['Date_Hour', 'EPEX_EUR_MWh']], on='Date_Hour', how='left')
-            epex_loaded = True
-            st.sidebar.success("EPEX Prijzen succesvol gekoppeld!")
-
-    if not epex_loaded:
-        df['EPEX_EUR_MWh'] = 0.0
 
     if 'slider_values' not in st.session_state: st.session_state['slider_values'] = {}
 
@@ -288,7 +239,7 @@ if df_hedge is not None:
                 break 
         return best_b, best_p
 
-    # --- STRATEGIE KNOPPEN ---
+    # Knoppen
     st.sidebar.markdown("---")
     st.sidebar.header("3. Kies Strategie")
 
@@ -313,14 +264,13 @@ if df_hedge is not None:
     if c4.button("⚖️ Balans 100%"): apply_strategy("100%_cov")
     if st.sidebar.button("📈 Over-Hedge 110%", use_container_width=True): apply_strategy("110%_cov")
 
-    with st.sidebar.expander("🧠 Hoe rekent de Optimizer?"):
-        st.caption("Bij targets (bijv. 5% Sell) gebruikt de tool een iteratief *Grid Search* algoritme. Hij start met een extreem hoge inkoop en stapt per 0,1 MW naar beneden totdat precies de gestelde limiet is bereikt.")
-
-    # --- SLIDERS ---
+    # Sliders MW
     st.sidebar.markdown("---")
-    st.sidebar.subheader("4. Fine-tuning (MW)")
+    st.sidebar.subheader("4. Fine-tuning Volumes (MW)")
     
-    df['Current_Hedge_MW'] = 0.0
+    df['Hedge_Base_MW'] = 0.0
+    df['Hedge_Peak_MW'] = 0.0
+    
     curr_min = df[p_mw_col].min()
     curr_max = df[p_mw_col].max()
     slider_min = float(np.floor(curr_min * 1.5 - 1))
@@ -334,7 +284,9 @@ if df_hedge is not None:
             
         b_yr = st.sidebar.slider("Base (Jaar)", slider_min, slider_max, key="slider_b_yr", step=0.1)
         p_yr = st.sidebar.slider("Peak (Jaar)", slider_min, slider_max, key="slider_p_yr", step=0.1)
-        df['Current_Hedge_MW'] = b_yr + (df['is_peak'] * p_yr)
+        
+        df['Hedge_Base_MW'] = b_yr
+        df['Hedge_Peak_MW'] = p_yr * df['is_peak']
     else:
         for q in [1, 2, 3, 4]:
             st.sidebar.markdown(f"**Kwartaal {q}**")
@@ -343,52 +295,119 @@ if df_hedge is not None:
                 def_b, def_p = find_optimal_mw(df[q_mask], percent_volume_target=100)
                 st.session_state[f'slider_b_q{q}'] = float(def_b); st.session_state[f'slider_p_q{q}'] = float(def_p)
             
-            c1, c2 = st.sidebar.columns(2)
-            b_q = c1.slider(f"Q{q} Base", slider_min, slider_max, key=f"slider_b_q{q}", step=0.1)
-            p_q = c2.slider(f"Q{q} Peak", slider_min, slider_max, key=f"slider_p_q{q}", step=0.1)
-            df.loc[q_mask, 'Current_Hedge_MW'] = b_q + (df.loc[q_mask, 'is_peak'] * p_q)
+            sc1, sc2 = st.sidebar.columns(2)
+            b_q = sc1.slider(f"Q{q} Base", slider_min, slider_max, key=f"slider_b_q{q}", step=0.1)
+            p_q = sc2.slider(f"Q{q} Peak", slider_min, slider_max, key=f"slider_p_q{q}", step=0.1)
+            
+            df.loc[q_mask, 'Hedge_Base_MW'] = b_q
+            df.loc[q_mask, 'Hedge_Peak_MW'] = p_q * df.loc[q_mask, 'is_peak']
+            
+    df['Current_Hedge_MW'] = df['Hedge_Base_MW'] + df['Hedge_Peak_MW']
 
-    # --- RESULTATEN DASHBOARD ---
+    # --- NIEUW: CONTRACTPRIJZEN BLOKKEN ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("5. Contractprijzen (Inkoopblokken)")
+    
+    df['Price_Base'] = 0.0
+    df['Price_Peak'] = 0.0
+    
+    if strategy_period == "Per Jaar":
+        cp1, cp2 = st.sidebar.columns(2)
+        pr_b = cp1.number_input("Base Prijs (€/MWh)", value=80.0, step=1.0)
+        pr_p = cp2.number_input("Peak Prijs (€/MWh)", value=100.0, step=1.0)
+        df['Price_Base'] = pr_b
+        df['Price_Peak'] = pr_p
+    else:
+        for q in [1, 2, 3, 4]:
+            st.sidebar.markdown(f"**Prijzen Q{q}**")
+            cp1, cp2 = st.sidebar.columns(2)
+            pr_b = cp1.number_input(f"Q{q} Base (€/MWh)", value=80.0, step=1.0, key=f"pr_b_q{q}")
+            pr_p = cp2.number_input(f"Q{q} Peak (€/MWh)", value=100.0, step=1.0, key=f"pr_p_q{q}")
+            q_mask = df['Quarter'] == q
+            df.loc[q_mask, 'Price_Base'] = pr_b
+            df.loc[q_mask, 'Price_Peak'] = pr_p
+
+    # --- ENTSO-E INPUT ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("6. Financiële Module (Spotmarkt EPEX)")
+    use_epex = st.sidebar.checkbox("Laad Spotprijzen in via ENTSO-E", value=False)
+    api_key = st.sidebar.text_input("ENTSO-E API Key", value="af129bcc-226c-4c4b-bfe1-dc7d9b5a5217", type="password")
+    
+    epex_loaded = False
+    if use_epex:
+        start_dt = df['Date'].min()
+        end_dt = df['Date'].max()
+        df_epex = fetch_epex_prices(api_key, start_dt, end_dt)
+        
+        if isinstance(df_epex, str):
+            st.sidebar.error(f"⚠️ Fout bij ophalen EPEX: Zorg dat je 'entsoe-py' aan je requirements.txt hebt toegevoegd. Details: {df_epex}")
+        else:
+            df['Date_Hour'] = df['Date'].dt.floor('H')
+            df = pd.merge(df, df_epex[['Date_Hour', 'EPEX_EUR_MWh']], on='Date_Hour', how='left')
+            epex_loaded = True
+            st.sidebar.success("EPEX Prijzen succesvol gekoppeld!")
+
+    if not epex_loaded:
+        df['EPEX_EUR_MWh'] = 0.0
+
+    # --- RESULTATEN BEREKENEN ---
     df['Profile_MWh'] = df[p_mw_col] * 0.25
     df['Hedge_MWh'] = df['Current_Hedge_MW'] * 0.25
     df['Used_Hedge_MWh'] = np.minimum(df['Hedge_MWh'], df['Profile_MWh']) 
     df['Over_Hedge_MWh'] = np.maximum(0, df['Hedge_MWh'] - df['Profile_MWh'])
     df['Under_Hedge_MWh'] = np.maximum(0, df['Profile_MWh'] - df['Hedge_MWh'])
 
-    if epex_loaded:
-        df['Cost_Buy_EUR'] = df['Under_Hedge_MWh'] * df['EPEX_EUR_MWh']
-        df['Rev_Sell_EUR'] = df['Over_Hedge_MWh'] * df['EPEX_EUR_MWh']
-        df['Net_Spot_EUR'] = df['Rev_Sell_EUR'] - df['Cost_Buy_EUR']
+    # Blok kosten = (MW * 0.25) * Prijs
+    df['Cost_Hedge_Base_EUR'] = (df['Hedge_Base_MW'] * 0.25) * df['Price_Base']
+    df['Cost_Hedge_Peak_EUR'] = (df['Hedge_Peak_MW'] * 0.25) * df['Price_Peak']
+    df['Cost_Hedge_Total_EUR'] = df['Cost_Hedge_Base_EUR'] + df['Cost_Hedge_Peak_EUR']
+    
+    tot_hedge_eur = df['Cost_Hedge_Total_EUR'].sum()
+
+    # Spotmarkt kosten
+    df['Cost_Buy_EUR'] = df['Under_Hedge_MWh'] * df['EPEX_EUR_MWh'] if epex_loaded else 0.0
+    df['Rev_Sell_EUR'] = df['Over_Hedge_MWh'] * df['EPEX_EUR_MWh'] if epex_loaded else 0.0
+    df['Net_Spot_EUR'] = df['Rev_Sell_EUR'] - df['Cost_Buy_EUR'] if epex_loaded else 0.0
 
     total_prof = df['Profile_MWh'].sum()
     total_over = df['Over_Hedge_MWh'].sum()
     total_under = df['Under_Hedge_MWh'].sum()
     denom = total_prof if total_prof != 0 else 1.0
     
+    # UI METRICS VOLUMES
     st.markdown("### 📊 Volume Balans")
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Effectieve Dekking", f"{(df['Used_Hedge_MWh'].sum()/denom)*100:.1f}%", help="Percentage van het verbruik dat rechtstreeks uit de inkoopblokken gedekt werd.")
-    k2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh", help="Totaal jaarvolume van het gekozen profiel.")
-    k3.metric("Teveel (Over-hedge)", f"{total_over:,.0f} MWh", f"{(total_over/denom)*100:.1f}%", delta_color="inverse", help="Volume dat is ingekocht maar niet verbruikt (verkocht op spot).")
-    k4.metric("Tekort (Under-hedge)", f"{total_under:,.0f} MWh", f"{(total_under/denom)*100:.1f}%", delta_color="inverse", help="Volume dat ongedekt was (bijgekocht op spot).")
+    k1.metric("Effectieve Dekking", f"{(df['Used_Hedge_MWh'].sum()/denom)*100:.1f}%")
+    k2.metric("Totaal Verbruik", f"{total_prof:,.0f} MWh")
+    k3.metric("Teveel (Over-hedge)", f"{total_over:,.0f} MWh", f"{(total_over/denom)*100:.1f}%", delta_color="inverse")
+    k4.metric("Tekort (Under-hedge)", f"{total_under:,.0f} MWh", f"{(total_under/denom)*100:.1f}%", delta_color="inverse")
 
+    # UI METRICS FINANCIEEL
     if epex_loaded:
-        st.markdown("### 💶 Financiële Waardering Spotmarkt (Restprofiel)")
+        st.markdown("### 💶 Financiële Waardering Totaal (Blokken + Spotmarkt)")
         f1, f2, f3, f4 = st.columns(4)
         
-        tot_buy_eur = df['Cost_Buy_EUR'].sum()
-        tot_sell_eur = df['Rev_Sell_EUR'].sum()
-        net_eur = df['Net_Spot_EUR'].sum()
-        avg_epex = df['EPEX_EUR_MWh'].mean()
+        net_spot_eur = df['Net_Spot_EUR'].sum()
+        # Totale kosten = Vaste Blokken MINUS Netto Spot Resultaat
+        # (Als spot netto geld oplevert, verlaagt dit je kosten. Als spot geld kost, verhoogt dit de kosten)
+        tot_energy_cost = tot_hedge_eur - net_spot_eur 
         
-        f1.metric("Spot Inkoopkosten", f"€ {tot_buy_eur:,.0f}", help="Kosten om het Tekort (Under-hedge) bij te kopen tegen uurprijzen. (Lager = Beter)")
-        f2.metric("Spot Verkoopopbrengst", f"€ {tot_sell_eur:,.0f}", help="Opbrengst van het Teveel (Over-hedge) verkopen tegen uurprijzen. Let op: door negatieve uren kan meer verkopen soms MINDER opleveren!")
+        f1.metric("Kosten Inkoopblokken", f"€ {tot_hedge_eur:,.0f}", help="Vaste inkoopkosten o.b.v. de ingestelde prijzen in de zijbalk.")
         
-        net_color = "normal" if net_eur >= 0 else "inverse"
-        f3.metric("Netto Spot Resultaat", f"€ {net_eur:,.0f}", delta=f"Gem. EPEX: € {avg_epex:.2f}", delta_color=net_color, help="Verkoopopbrengst minus Inkoopkosten. Positief betekent dat de spotmarkt netto geld opleverde.")
+        net_color = "normal" if net_spot_eur >= 0 else "inverse"
+        f2.metric("Netto Spot Resultaat", f"€ {net_spot_eur:,.0f}", delta="Winst" if net_spot_eur >=0 else "Verlies", delta_color=net_color, help="Verkoopopbrengst minus Inkoopkosten op de spotmarkt.")
         
-        avg_cost_residual = (tot_buy_eur - tot_sell_eur) / denom if denom > 0 else 0
-        f4.metric("Netto Spot Impact per MWh", f"€ {avg_cost_residual:.2f} / MWh", help="Hoeveel de spotmarkt netto heeft gekost per totaal verbruikte MWh.")
+        f3.metric("Totale Energiekosten", f"€ {tot_energy_cost:,.0f}", help="Kosten Inkoopblokken MINUS Netto Spot Resultaat.")
+        
+        avg_cost = tot_energy_cost / denom if denom > 0 else 0
+        f4.metric("Integrale Kostprijs", f"€ {avg_cost:.2f} / MWh", help="Totale Energiekosten gedeeld door je totale MWh verbruik.")
+    else:
+        st.markdown("### 💶 Financiële Waardering (Alleen Inkoopblokken)")
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Kosten Inkoopblokken", f"€ {tot_hedge_eur:,.0f}", help="Vaste inkoopkosten o.b.v. de ingestelde prijzen in de zijbalk.")
+        gem_blok = tot_hedge_eur / df['Hedge_MWh'].sum() if df['Hedge_MWh'].sum() > 0 else 0
+        f2.metric("Gemiddelde Blokprijs", f"€ {gem_blok:.2f} / MWh")
+        st.info("💡 Zet de EPEX Spotprijzen aan in de zijbalk om je volledige integrale kostprijs te berekenen.")
 
     st.markdown("---")
     st.subheader("🔎 Seizoensanalyse (4 Representatieve Weken)")
@@ -422,21 +441,21 @@ if df_hedge is not None:
         'Dekking %': (x['Used_Hedge_MWh'].sum() / x['Profile_MWh'].sum() * 100) if x['Profile_MWh'].sum() != 0 else 0,
         'Teveel (MWh)': x['Over_Hedge_MWh'].sum(),
         'Tekort (MWh)': x['Under_Hedge_MWh'].sum(),
+        'Blokken Kosten (€)': x['Cost_Hedge_Total_EUR'].sum(),
         'EPEX Gem. (€/MWh)': x['EPEX_EUR_MWh'].mean() if epex_loaded else 0,
-        'Spot Inkoop (€)': x['Cost_Buy_EUR'].sum() if epex_loaded else 0,
-        'Spot Verkoop (€)': x['Rev_Sell_EUR'].sum() if epex_loaded else 0,
         'Netto Spot (€)': x['Net_Spot_EUR'].sum() if epex_loaded else 0,
+        'Totale Kosten (€)': (x['Cost_Hedge_Total_EUR'].sum() - x['Net_Spot_EUR'].sum()) if epex_loaded else x['Cost_Hedge_Total_EUR'].sum(),
+        'Gem. Prijs (€/MWh)': ((x['Cost_Hedge_Total_EUR'].sum() - x['Net_Spot_EUR'].sum()) / x['Profile_MWh'].sum()) if epex_loaded and x['Profile_MWh'].sum() != 0 else (x['Cost_Hedge_Total_EUR'].sum() / x['Profile_MWh'].sum() if x['Profile_MWh'].sum() != 0 else 0)
     }))
 
     format_dict = {
-        'Verbruik (MWh)': "{:,.0f}", 'Dekking %': "{:.1f}%", 'Teveel (MWh)': "{:,.0f}", 'Tekort (MWh)': "{:,.0f}"
+        'Verbruik (MWh)': "{:,.0f}", 'Dekking %': "{:.1f}%", 'Teveel (MWh)': "{:,.0f}", 'Tekort (MWh)': "{:,.0f}",
+        'Blokken Kosten (€)': "€ {:,.0f}", 'Totale Kosten (€)': "€ {:,.0f}", 'Gem. Prijs (€/MWh)': "€ {:.2f}"
     }
     if epex_loaded:
-        format_dict.update({
-            'EPEX Gem. (€/MWh)': "€ {:.2f}", 'Spot Inkoop (€)': "€ {:,.0f}", 'Spot Verkoop (€)': "€ {:,.0f}", 'Netto Spot (€)': "€ {:,.0f}"
-        })
+        format_dict.update({'EPEX Gem. (€/MWh)': "€ {:.2f}", 'Netto Spot (€)': "€ {:,.0f}"})
     else:
-        q_stats = q_stats.drop(columns=['EPEX Gem. (€/MWh)', 'Spot Inkoop (€)', 'Spot Verkoop (€)', 'Netto Spot (€)'])
+        q_stats = q_stats.drop(columns=['EPEX Gem. (€/MWh)', 'Netto Spot (€)'])
 
     st.dataframe(q_stats.style.format(format_dict), use_container_width=True)
 
