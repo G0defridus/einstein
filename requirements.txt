@@ -4,5 +4,6 @@ numpy
 altair
 entsoe-py
 openpyxl
-os
-glob
+lxml
+beautifulsoup4
+requests
