@@ -4,3 +4,5 @@ numpy
 altair
 entsoe-py
 openpyxl
+os
+glob
